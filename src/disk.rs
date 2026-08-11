@@ -1,8 +1,6 @@
-use pretty_hex::PrettyHex;
 use std::{
     fs::{File, OpenOptions},
     os::unix::fs::FileExt,
-    time::Instant,
 };
 
 struct Disk {
