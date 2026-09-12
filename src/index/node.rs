@@ -1,4 +1,4 @@
-use super::arena::NodeId;
+use crate::page::PageId;
 
 #[derive(PartialEq, Debug)]
 pub enum BTreeNode {
@@ -9,11 +9,11 @@ pub enum BTreeNode {
 #[derive(PartialEq, Debug)]
 pub struct LeafNode {
     pub keys: Vec<u32>,
-    pub right_leaf: Option<NodeId>,
+    pub right_leaf: Option<PageId>,
 }
 
 #[derive(PartialEq, Debug)]
 pub struct InternalNode {
     pub keys: Vec<u32>,
-    pub child_nodes: Vec<NodeId>,
+    pub child_nodes: Vec<PageId>,
 }

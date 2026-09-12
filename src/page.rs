@@ -3,10 +3,12 @@ use crate::disk::PAGE_SIZE;
 pub const HEADER_SIZE: usize = 20;
 const SLOT_SIZE: usize = 4;
 
+pub type PageId = u32;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PageHeader {
     lsn: u64,
-    page_id: u32,
+    page_id: PageId,
     slot_count: u16,
     free_start: u16,
     free_end: u16,
@@ -14,8 +16,20 @@ struct PageHeader {
     is_deleted: bool,
 }
 
-struct Page {
+#[derive(Debug)]
+pub struct Page {
     buf: Box<[u8; PAGE_SIZE]>,
+}
+impl Page {
+    pub(crate) fn from_bytes(bytes: [u8; PAGE_SIZE]) -> Self {
+        Page {
+            buf: Box::new(bytes),
+        }
+    }
+
+    pub(crate) fn to_bytes(&self) -> &[u8; PAGE_SIZE] {
+        &self.buf
+    }
 }
 
 struct Slot {

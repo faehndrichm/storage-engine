@@ -1,8 +1,9 @@
-use super::{
-    Arena,
-    arena::NodeId,
-    node::{BTreeNode, InternalNode, LeafNode},
-};
+use std::fmt::Error;
+
+use super::node::{BTreeNode, InternalNode, LeafNode};
+use crate::buffer_pool::{self, BufferPool};
+use crate::index::node;
+use crate::page::{Page, PageId};
 
 impl LeafNode {
     fn new(config: &TreeConfig) -> Self {
@@ -24,8 +25,8 @@ impl InternalNode {
 
 #[derive(Debug)]
 pub struct BPlusTree {
-    root_id: NodeId,
-    arena: Arena,
+    root_id: PageId,
+    node_manager: NodeManager,
     config: TreeConfig,
 }
 
@@ -33,6 +34,28 @@ pub struct BPlusTree {
 pub struct TreeConfig {
     max_order: usize,
     debug: bool,
+}
+
+#[derive(Debug)]
+struct NodeManager {
+    buffer_pool: BufferPool,
+}
+impl NodeManager {
+    fn get(&mut self, node_id: PageId) -> std::io::Result<BTreeNode> {
+        let page = self.buffer_pool.get_page(node_id)?;
+        let node = BTreeNode::from_page(&page)?;
+        Ok(node)
+    }
+    fn create(&mut self, node: BTreeNode) -> std::io::Result<PageId> {
+        let page = node.into_page();
+        let node_id = self.buffer_pool.allocate_page(page)?;
+        Ok(node_id)
+    }
+    fn write(&mut self, node_id: PageId, node: BTreeNode) -> std::io::Result<()> {
+        let page = node.into_page();
+        self.buffer_pool.write_page(node_id, page)?;
+        Ok(())
+    }
 }
 
 impl TreeConfig {
@@ -66,43 +89,36 @@ impl TreeConfig {
 }
 
 impl BPlusTree {
-    pub fn new(config: TreeConfig) -> Self {
-        let mut arena = Arena::new();
+    pub fn new(buffer_pool: BufferPool, config: TreeConfig) -> Self {
+        let mut node_manager = NodeManager {
+            buffer_pool: buffer_pool,
+        };
+
         let root = BTreeNode::Leaf(LeafNode::new(&config));
-        let root_id = arena.push(root);
+        let root_id = node_manager.create(root).unwrap();
 
         Self {
             root_id: root_id,
-            arena: arena,
+            node_manager: node_manager,
             config,
         }
     }
 
-    pub fn from_root(config: TreeConfig, root: BTreeNode) -> Self {
-        let mut arena = Arena::new();
-        let root_id = arena.push(root);
-
-        Self {
-            config,
-            arena,
-            root_id,
-        }
-    }
-
+    // TODO: dont know what to do with this right now
     // TODO: Maybe pass a Vec here, Arena should be internal only
-    pub fn from_root_with_arena(config: TreeConfig, root_id: NodeId, arena: Arena) -> Self {
-        Self {
-            config,
-            arena,
-            root_id,
-        }
-    }
+    //pub fn from_root_with_arena(config: TreeConfig, root_id: PageId, arena: Arena) -> Self {
+    //    Self {
+    //        config,
+    //        arena,
+    //        root_id,
+    //    }
+    //}
 
     pub fn print(&self) {
         println!("B+ Tree:");
-
-        let root = self.arena.get(self.root_id).unwrap();
-        root.print(self.root_id, 0, &self.arena);
+        // TODO
+        //let root = self.arena.get(self.root_id).unwrap();
+        //root.print(self.root_id, 0, &self.arena);
         println!("End");
         println!("");
     }
@@ -125,12 +141,12 @@ impl BPlusTree {
 // }
 
 impl BPlusTree {
-    pub fn find(&self, value: u32) -> bool {
+    pub fn find(&mut self, value: u32) -> bool {
         self.find_node(self.root_id, value)
     }
 
-    fn find_node(&self, node_id: NodeId, value: u32) -> bool {
-        let node = self.arena.get(node_id).unwrap();
+    fn find_node(&mut self, node_id: PageId, value: u32) -> bool {
+        let node = self.node_manager.get(node_id).unwrap();
 
         match node {
             BTreeNode::Leaf(leaf) => leaf.keys.contains(&value),
@@ -141,14 +157,14 @@ impl BPlusTree {
         }
     }
 
-    pub fn range(&self, from: Option<u32>, to: Option<u32>) -> Vec<u32> {
+    pub fn range(&mut self, from: Option<u32>, to: Option<u32>) -> Vec<u32> {
         let from = from.unwrap_or(u32::MIN);
         let to = to.unwrap_or(u32::MAX);
         self.range_node(self.root_id, from, to)
     }
 
-    pub fn descend_to_leaf(&self, node_id: NodeId, from: u32) -> NodeId {
-        let node = self.arena.get(node_id).unwrap();
+    pub fn descend_to_leaf(&mut self, node_id: PageId, from: u32) -> PageId {
+        let node = self.node_manager.get(node_id).unwrap();
         match node {
             BTreeNode::Leaf(_) => node_id,
             BTreeNode::Internal(internal) => {
@@ -158,14 +174,14 @@ impl BPlusTree {
         }
     }
 
-    fn range_node(&self, node_id: NodeId, from: u32, to: u32) -> Vec<u32> {
+    fn range_node(&mut self, node_id: PageId, from: u32, to: u32) -> Vec<u32> {
         let mut values = Vec::with_capacity(1024);
         let mut current_node_id = Some(self.descend_to_leaf(node_id, from));
         let mut first = true;
 
         while let Some(cur) = current_node_id {
-            let leaf = match self.arena.get(cur) {
-                Some(BTreeNode::Leaf(l)) => l,
+            let leaf = match self.node_manager.get(cur).unwrap() {
+                BTreeNode::Leaf(l) => l,
                 _ => unreachable!(),
             };
 
@@ -206,7 +222,10 @@ impl BPlusTree {
                 new_root_node.keys.push(split.seperator_key);
 
                 // assign new root
-                let new_root_id = self.arena.push(BTreeNode::Internal(new_root_node));
+                let new_root_id = self
+                    .node_manager
+                    .create(BTreeNode::Internal(new_root_node))
+                    .unwrap();
                 self.root_id = new_root_id;
                 true
             }
@@ -215,64 +234,54 @@ impl BPlusTree {
         }
     }
 
-    fn insert_node(&mut self, node_id: NodeId, value: u32) -> InsertResult {
-        let node = self.arena.get_mut(node_id).unwrap();
+    fn insert_node(&mut self, node_id: PageId, value: u32) -> InsertResult {
+        let node = self.node_manager.get(node_id).unwrap();
         let index = node.find_child_index(value);
 
         // handle leaf case first
-        let child_node_id = match node {
-            BTreeNode::Leaf(leaf) => {
+        let mut internal = match node {
+            BTreeNode::Leaf(mut leaf) => {
                 if leaf.keys.contains(&value) {
                     return InsertResult::DuplicateKey;
                 }
 
                 leaf.keys.insert(index, value);
                 if leaf.keys.len() < self.config.max_order {
+                    self.node_manager
+                        .write(node_id, BTreeNode::Leaf(leaf))
+                        .unwrap();
                     return InsertResult::Inserted;
                 }
 
                 // Create a leaf split
-                let mut leaf_split_node = LeafNode::new(&self.config);
-                leaf_split_node.keys = leaf.keys.split_off(self.config.max_order / 2);
-                let separator_key = leaf_split_node.keys[0];
-                let split_node_id = self.arena.push(BTreeNode::Leaf(leaf_split_node));
+                let mut split_node = LeafNode::new(&self.config);
+                split_node.keys = leaf.keys.split_off(self.config.max_order / 2);
 
-                // set the leaf pointer
-                let moved_leaf_pointer = match self.arena.get_mut(node_id).unwrap() {
-                    BTreeNode::Leaf(leaf) => {
-                        let old_right_leaf = leaf.right_leaf;
-                        leaf.right_leaf = Some(split_node_id);
-                        old_right_leaf
-                    }
-                    BTreeNode::Internal(_) => unreachable!(),
-                };
+                // Connect the new node to the previous right neighbour
+                split_node.right_leaf = leaf.right_leaf;
+                let separator_key = split_node.keys[0];
+                let split_node_id = self
+                    .node_manager
+                    .create(BTreeNode::Leaf(split_node))
+                    .unwrap();
 
-                match self.arena.get_mut(split_node_id).unwrap() {
-                    BTreeNode::Leaf(leaf) => {
-                        leaf.right_leaf = moved_leaf_pointer;
-                    }
-                    BTreeNode::Internal(_) => unreachable!(),
-                };
+                // Link the current leaf to the new one
+                leaf.right_leaf = Some(split_node_id);
+                self.node_manager
+                    .write(node_id, BTreeNode::Leaf(leaf))
+                    .unwrap();
 
                 return InsertResult::Split(InsertSplit {
                     seperator_key: separator_key,
                     split_node: split_node_id,
                 });
             }
-            BTreeNode::Internal(internal) => internal.child_nodes[index], // for internal we grab the child id
-        };
-
-        let split = match self.insert_node(child_node_id, value) {
-            InsertResult::Split(s) => s,
-            other => {
-                return other;
-            }
-        };
-
-        // We know we have an internal here, since we checked the leaf case first, TODO: better way?
-        let internal = match self.arena.get_mut(node_id).unwrap() {
             BTreeNode::Internal(internal) => internal,
-            BTreeNode::Leaf(_) => unreachable!(),
+        };
+
+        let split = match self.insert_node(internal.child_nodes[index], value) {
+            InsertResult::Split(s) => s,
+            other => return other,
         };
 
         // Insert the split node, TODO: maybe we can do the split logic from the leaf branch here
@@ -282,14 +291,11 @@ impl BPlusTree {
         let internal_keys_after_insert = internal.keys.len();
 
         if internal_keys_after_insert < self.config.max_order {
+            self.node_manager
+                .write(node_id, BTreeNode::Internal(internal))
+                .unwrap();
             return InsertResult::Inserted;
         }
-
-        // re-borrow is necesarry here
-        let internal = match self.arena.get_mut(node_id).unwrap() {
-            BTreeNode::Internal(internal) => internal,
-            BTreeNode::Leaf(_) => unreachable!(),
-        };
 
         // When splitting another overflow can occur, need another split
         let mut internal_split_node = InternalNode::new(&self.config);
@@ -298,7 +304,13 @@ impl BPlusTree {
         internal_split_node.child_nodes = internal.child_nodes.split_off(internal_split_index);
 
         let seperator_key = internal.keys.pop().unwrap();
-        let split_node_id = self.arena.push(BTreeNode::Internal(internal_split_node));
+        let split_node_id = self
+            .node_manager
+            .create(BTreeNode::Internal(internal_split_node))
+            .unwrap();
+        self.node_manager
+            .write(node_id, BTreeNode::Internal(internal))
+            .unwrap();
 
         InsertResult::Split(InsertSplit {
             seperator_key,
@@ -315,7 +327,7 @@ impl BPlusTree {
             DeleteResult::NotFound => false,
             DeleteResult::Deleted => true,
             DeleteResult::DeletedUpdateInternal(_) => {
-                let root = self.arena.get(self.root_id).unwrap();
+                let root = self.node_manager.get(self.root_id).unwrap();
                 match root {
                     BTreeNode::Leaf(_) => {
                         // Can be ignored, the root is a single leaf.
@@ -328,7 +340,7 @@ impl BPlusTree {
             }
             DeleteResult::Rebalance => {
                 // TODO: refactor !!!
-                let root = self.arena.get_mut(self.root_id).unwrap();
+                let root = self.node_manager.get(self.root_id).unwrap();
 
                 let should_recompute = if let BTreeNode::Internal(root_internal) = root
                     && root_internal.child_nodes.len() == 1
@@ -342,7 +354,7 @@ impl BPlusTree {
 
                 // it seems in this case its preferable to recompute all keys from the children
                 if should_recompute && let Some(keys) = self.recompute_keys(self.root_id) {
-                    let new_root = self.arena.get_mut(self.root_id).unwrap();
+                    let new_root = self.node_manager.get(self.root_id).unwrap();
 
                     if let BTreeNode::Internal(new_internal_root) = new_root {
                         new_internal_root.keys = keys;
@@ -354,8 +366,8 @@ impl BPlusTree {
         }
     }
 
-    fn delete_node(&mut self, node_id: NodeId, value: u32) -> DeleteResult {
-        let node = self.arena.get_mut(node_id).unwrap();
+    fn delete_node(&mut self, node_id: PageId, value: u32) -> DeleteResult {
+        let node = self.node_manager.get(node_id).unwrap();
         let index = node.find_child_index(value);
 
         let child_node_id = match node {
@@ -398,7 +410,7 @@ impl BPlusTree {
                     maybe_right_sibling_id,
                     maybe_parent_left_key,
                     maybe_parent_right_key,
-                ) = match self.arena.get(node_id).unwrap() {
+                ) = match self.node_manager.get(node_id).unwrap() {
                     BTreeNode::Internal(internal) => (
                         index
                             .checked_sub(1)
@@ -418,7 +430,7 @@ impl BPlusTree {
                 if let Some(left_sibling_id) = maybe_left_sibling_id
                     && let Some(parent_left_key) = maybe_parent_left_key
                 {
-                    let left_sibling = self.arena.get_mut(left_sibling_id).unwrap();
+                    let left_sibling = self.node_manager.get(left_sibling_id).unwrap();
 
                     let len = match left_sibling {
                         BTreeNode::Leaf(leaf) => leaf.keys.len(),
@@ -438,7 +450,7 @@ impl BPlusTree {
                             }
                         };
 
-                        let current_child = self.arena.get_mut(child_node_id).unwrap();
+                        let current_child = self.node_manager.get(child_node_id).unwrap();
                         match current_child {
                             BTreeNode::Leaf(leaf) => {
                                 leaf.keys.insert(0, borrow_key);
@@ -452,7 +464,7 @@ impl BPlusTree {
                             }
                         }
 
-                        let parent_mut = match self.arena.get_mut(node_id).unwrap() {
+                        let parent_mut = match self.node_manager.get(node_id).unwrap() {
                             BTreeNode::Internal(internal) => internal,
                             BTreeNode::Leaf(_) => unreachable!(),
                         };
@@ -467,7 +479,7 @@ impl BPlusTree {
                 if let Some(right_sibling_id) = maybe_right_sibling_id
                     && let Some(parent_right_key) = maybe_parent_right_key
                 {
-                    let right_sibling = self.arena.get_mut(right_sibling_id).unwrap();
+                    let right_sibling = self.node_manager.get(right_sibling_id).unwrap();
                     let len = match right_sibling {
                         BTreeNode::Leaf(leaf) => leaf.keys.len(),
                         BTreeNode::Internal(internal) => internal.keys.len(),
@@ -488,7 +500,7 @@ impl BPlusTree {
                             ),
                         };
 
-                        let current_child = self.arena.get_mut(child_node_id).unwrap();
+                        let current_child = self.node_manager.get(child_node_id).unwrap();
                         match current_child {
                             BTreeNode::Leaf(leaf) => {
                                 let key = borrow_key.expect(
@@ -504,7 +516,7 @@ impl BPlusTree {
                             }
                         }
 
-                        let parent_mut = match self.arena.get_mut(node_id).unwrap() {
+                        let parent_mut = match self.node_manager.get(node_id).unwrap() {
                             BTreeNode::Internal(internal) => internal,
                             BTreeNode::Leaf(_) => unreachable!(),
                         };
@@ -515,10 +527,10 @@ impl BPlusTree {
 
                 // try merging with the left sibling
                 if let Some(left_sibling_id) = maybe_left_sibling_id {
-                    match self.arena.get_mut(child_node_id).unwrap() {
+                    match self.node_manager.get(child_node_id).unwrap() {
                         BTreeNode::Leaf(cur_leaf) => {
                             let mut cur_keys = std::mem::take(&mut cur_leaf.keys);
-                            match self.arena.get_mut(left_sibling_id).unwrap() {
+                            match self.node_manager.get(left_sibling_id).unwrap() {
                                 BTreeNode::Leaf(left_leaf) => left_leaf.keys.append(&mut cur_keys),
                                 BTreeNode::Internal(_) => {
                                     unreachable!("Leaf/Internal mismatch is impossible here")
@@ -528,7 +540,7 @@ impl BPlusTree {
                         BTreeNode::Internal(cur_internal) => {
                             let mut cur_keys = std::mem::take(&mut cur_internal.keys);
                             let mut cur_children = std::mem::take(&mut cur_internal.child_nodes);
-                            match self.arena.get_mut(left_sibling_id).unwrap() {
+                            match self.node_manager.get(left_sibling_id).unwrap() {
                                 BTreeNode::Internal(left_internal) => {
                                     // When internal nodes merge, we have to pull down the parent key
                                     let parent_left_key = maybe_parent_left_key
@@ -544,7 +556,7 @@ impl BPlusTree {
                         }
                     }
 
-                    let parent_mut = match self.arena.get_mut(node_id).unwrap() {
+                    let parent_mut = match self.node_manager.get(node_id).unwrap() {
                         BTreeNode::Internal(internal) => internal,
                         BTreeNode::Leaf(_) => unreachable!(),
                     };
@@ -560,10 +572,10 @@ impl BPlusTree {
 
                 // try merging with the right sibling
                 if let Some(right_sibling_id) = maybe_right_sibling_id {
-                    match self.arena.get_mut(child_node_id).unwrap() {
+                    match self.node_manager.get(child_node_id).unwrap() {
                         BTreeNode::Leaf(cur_leaf) => {
                             let mut cur_keys = std::mem::take(&mut cur_leaf.keys);
-                            match self.arena.get_mut(right_sibling_id).unwrap() {
+                            match self.node_manager.get(right_sibling_id).unwrap() {
                                 BTreeNode::Leaf(right_leaf) => {
                                     // cur_keys (left) must come first, then right_leaf's existing keys.
                                     cur_keys.append(&mut right_leaf.keys);
@@ -577,7 +589,7 @@ impl BPlusTree {
                         BTreeNode::Internal(cur_internal) => {
                             let mut cur_keys = std::mem::take(&mut cur_internal.keys);
                             let mut cur_children = std::mem::take(&mut cur_internal.child_nodes);
-                            match self.arena.get_mut(right_sibling_id).unwrap() {
+                            match self.node_manager.get(right_sibling_id).unwrap() {
                                 BTreeNode::Internal(right_internal) => {
                                     // When internal nodes merge, we have to pull down the parent key
                                     let parent_right_key = maybe_parent_right_key
@@ -596,7 +608,7 @@ impl BPlusTree {
                         }
                     }
 
-                    let parent_mut = match self.arena.get_mut(node_id).unwrap() {
+                    let parent_mut = match self.node_manager.get(node_id).unwrap() {
                         BTreeNode::Internal(internal) => internal,
                         BTreeNode::Leaf(_) => unreachable!(),
                     };
@@ -615,7 +627,7 @@ impl BPlusTree {
             }
             DeleteResult::DeletedUpdateInternal(new_min) => {
                 if index > 0 {
-                    let parent_mut = match self.arena.get_mut(node_id).unwrap() {
+                    let parent_mut = match self.node_manager.get(node_id).unwrap() {
                         BTreeNode::Internal(internal) => internal,
                         BTreeNode::Leaf(_) => unreachable!(),
                     };
@@ -628,8 +640,8 @@ impl BPlusTree {
     }
 
     // we can always call this to restore the invariant, but there may be cases where a more trivial way exists the update the key(s)
-    fn recompute_keys(&self, node_id: NodeId) -> Option<Vec<u32>> {
-        match self.arena.get(node_id).unwrap() {
+    fn recompute_keys(&mut self, node_id: PageId) -> Option<Vec<u32>> {
+        match self.node_manager.get(node_id).unwrap() {
             BTreeNode::Internal(internal) => Some(
                 internal
                     .child_nodes
@@ -642,8 +654,8 @@ impl BPlusTree {
         }
     }
 
-    fn leftmost_key(&self, node_id: NodeId) -> u32 {
-        match self.arena.get(node_id).unwrap() {
+    fn leftmost_key(&mut self, node_id: PageId) -> u32 {
+        match self.node_manager.get(node_id).unwrap() {
             BTreeNode::Leaf(leaf) => leaf.keys[0],
             BTreeNode::Internal(internal) => self.leftmost_key(internal.child_nodes[0]),
         }
@@ -651,11 +663,11 @@ impl BPlusTree {
 }
 
 impl BPlusTree {
-    fn nodes_equal(&self, left_id: NodeId, right: &Self, right_id: NodeId) -> bool {
-        let Some(left_node) = self.arena.get(left_id) else {
+    fn nodes_equal(&mut self, left_id: PageId, right: &Self, right_id: PageId) -> bool {
+        let Ok(left_node) = self.node_manager.get(left_id) else {
             return false;
         };
-        let Some(right_node) = right.arena.get(right_id) else {
+        let Ok(right_node) = self.node_manager.get(right_id) else {
             return false;
         };
 
@@ -687,7 +699,7 @@ impl PartialEq for BPlusTree {
 
 struct InsertSplit {
     seperator_key: u32,
-    split_node: NodeId,
+    split_node: PageId,
 }
 
 enum DeleteResult {
@@ -704,6 +716,14 @@ enum InsertResult {
 }
 
 impl BTreeNode {
+    pub fn from_page(page: &Page) -> std::io::Result<Self> {
+        unimplemented!()
+    }
+
+    pub fn into_page(&self) -> Page {
+        unimplemented!()
+    }
+
     pub fn get_keys(&self) -> &Vec<u32> {
         match self {
             BTreeNode::Leaf(node) => node.get_keys(),
@@ -715,12 +735,12 @@ impl BTreeNode {
         self.get_keys().partition_point(|&k| k <= value)
     }
 
-    fn print(&self, node_id: NodeId, depth: usize, arena: &Arena) {
-        match self {
-            BTreeNode::Leaf(node) => node.print(node_id, depth),
-            BTreeNode::Internal(node) => node.print(depth, arena),
-        }
-    }
+    // fn print(&self, node_id: PageId, depth: usize, arena: &Arena) {
+    //     match self {
+    //         BTreeNode::Leaf(node) => node.print(node_id, depth),
+    //         BTreeNode::Internal(node) => node.print(depth, arena),
+    //     }
+    // }
 }
 
 impl InternalNode {
@@ -728,7 +748,7 @@ impl InternalNode {
         &self.keys
     }
 
-    pub fn find_child_node_id(&self, value: u32) -> NodeId {
+    pub fn find_child_node_id(&self, value: u32) -> PageId {
         let index = self.keys.partition_point(|&k| k <= value);
         self.child_nodes[index]
     }
@@ -736,15 +756,15 @@ impl InternalNode {
         self.keys.partition_point(|&k| k <= value)
     }
 
-    fn print(&self, depth: usize, arena: &Arena) {
-        let indent = "  ".repeat(depth);
-        println!("{}Internal {:?}", indent, self.keys);
+    // fn print(&self, depth: usize, arena: &Arena) {
+    //     let indent = "  ".repeat(depth);
+    //     println!("{}Internal {:?}", indent, self.keys);
 
-        for child_id in self.child_nodes.iter().copied() {
-            let child = arena.get(child_id).unwrap();
-            child.print(child_id, depth + 1, arena);
-        }
-    }
+    //     for child_id in self.child_nodes.iter().copied() {
+    //         let child = arena.get(child_id).unwrap();
+    //         child.print(child_id, depth + 1, arena);
+    //     }
+    // }
 }
 
 impl LeafNode {
@@ -755,7 +775,7 @@ impl LeafNode {
         self.keys.partition_point(|&k| k <= value)
     }
 
-    fn print(&self, node_id: NodeId, depth: usize) {
+    fn print(&self, node_id: PageId, depth: usize) {
         let indent = "  ".repeat(depth);
         println!(
             "{}Leaf {:?}, node_id: {},  pointer: {:?}",
@@ -798,32 +818,32 @@ impl NodeBuilder {
         self
     }
 
-    fn build(self, config: TreeConfig) -> BPlusTree {
-        let mut arena = Arena::new();
-        let root_id = self.build_into(&mut arena);
-        BPlusTree::from_root_with_arena(config, root_id, arena)
-    }
+    //  fn build(self, config: TreeConfig) -> BPlusTree {
+    //  let mut arena = Arena::new();
+    //      let root_id = self.build_into(&mut arena);
+    //      BPlusTree::from_root_with_arena(config, root_id, arena)
+    //  }
 
-    fn build_into(&self, arena: &mut Arena) -> NodeId {
-        match self.kind {
-            NodeKind::Leaf => arena.push(BTreeNode::Leaf(LeafNode {
-                keys: self.keys.clone(),
-                right_leaf: None,
-            })),
-            NodeKind::Internal => {
-                let child_nodes = self
-                    .children
-                    .iter()
-                    .map(|child| child.build_into(arena))
-                    .collect();
+    // fn build_into(&self, arena: &mut Arena) -> PageId {
+    //     match self.kind {
+    //         NodeKind::Leaf => arena.push(BTreeNode::Leaf(LeafNode {
+    //             keys: self.keys.clone(),
+    //             right_leaf: None,
+    //         })),
+    //         NodeKind::Internal => {
+    //             let child_nodes = self
+    //                 .children
+    //                 .iter()
+    //                 .map(|child| child.build_into(arena))
+    //                 .collect();
 
-                arena.push(BTreeNode::Internal(InternalNode {
-                    keys: self.keys.clone(),
-                    child_nodes,
-                }))
-            }
-        }
-    }
+    //             arena.push(BTreeNode::Internal(InternalNode {
+    //                 keys: self.keys.clone(),
+    //                 child_nodes,
+    //             }))
+    //         }
+    //     }
+    //                 }
 }
 
 fn build_main_tree() -> BPlusTree {
