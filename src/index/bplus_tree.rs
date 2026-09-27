@@ -2,7 +2,7 @@ use std::fmt::Error;
 
 use super::node::{BTreeNode, InternalNode, LeafNode};
 use crate::buffer_pool::{self, BufferPool};
-use crate::index::node;
+use crate::index::{self, node};
 use crate::page::{Page, PageId};
 
 impl LeafNode {
@@ -51,7 +51,7 @@ impl NodeManager {
         let node_id = self.buffer_pool.allocate_page(page)?;
         Ok(node_id)
     }
-    fn write(&mut self, node_id: PageId, node: BTreeNode) -> std::io::Result<()> {
+    fn write(&mut self, node_id: PageId, node: &BTreeNode) -> std::io::Result<()> {
         let page = node.into_page();
         self.buffer_pool.write_page(node_id, page)?;
         Ok(())
@@ -366,277 +366,292 @@ impl BPlusTree {
         }
     }
 
+    // For the -> direction, the borrowed key equals the seperator, since it will become the first key of the right child. (Leaf case).
+    fn borrow_left(
+        &mut self,
+        parent: &mut InternalNode,
+        child: &mut BTreeNode,
+        left_sibling: &mut BTreeNode,
+        index: usize,
+        parent_left_key: u32,
+    ) {
+        let (borrow_key, borrow_child) = match left_sibling {
+            BTreeNode::Leaf(leaf) => (leaf.keys.pop().unwrap(), None),
+            BTreeNode::Internal(internal) => {
+                let k = internal.keys.pop().unwrap();
+                let c = internal.child_nodes.pop().unwrap();
+                (k, Some(c))
+            }
+        };
+
+        match child {
+            BTreeNode::Leaf(leaf) => {
+                leaf.keys.insert(0, borrow_key);
+            }
+            BTreeNode::Internal(internal) => {
+                // when we do internal borrows, we need to rotate the seperator keys
+                internal.keys.insert(0, parent_left_key);
+                if let Some(child) = borrow_child {
+                    internal.child_nodes.insert(0, child);
+                }
+            }
+        }
+
+        parent.keys[index - 1] = borrow_key;
+    }
+
+    // For the -> direction, the borrowed key is different from the seperator to update (Leaf case).
+    fn borrow_right(
+        &mut self,
+        parent: &mut InternalNode,
+        child: &mut BTreeNode,
+        right_sibling: &mut BTreeNode,
+        index: usize,
+        parent_right_key: u32,
+    ) {
+        let (borrow_key, update_seperator_key, borrow_child) = match right_sibling {
+            BTreeNode::Leaf(leaf_sibling) => (
+                Some(leaf_sibling.keys.remove(0)),
+                leaf_sibling.keys[0],
+                None,
+            ),
+            BTreeNode::Internal(internal_sibling) => (
+                None,
+                internal_sibling.keys.remove(0),
+                Some(internal_sibling.child_nodes.remove(0)),
+            ),
+        };
+
+        match child {
+            BTreeNode::Leaf(leaf) => {
+                let key =
+                    borrow_key.expect("Value has to be since sibling must be both leaf nodes.");
+                leaf.keys.push(key);
+            }
+            BTreeNode::Internal(internal) => {
+                internal.keys.push(parent_right_key);
+                if let Some(child) = borrow_child {
+                    internal.child_nodes.push(child);
+                }
+            }
+        }
+
+        parent.keys[index] = update_seperator_key;
+    }
+
+    fn merge_left(
+        &mut self,
+        parent: &mut InternalNode,
+        child: &mut BTreeNode,
+        left_sibling: &mut BTreeNode,
+        index: usize,
+        parent_left_key: u32,
+    ) {
+        match child {
+            BTreeNode::Leaf(cur_leaf) => {
+                let mut cur_keys = std::mem::take(&mut cur_leaf.keys);
+                match left_sibling {
+                    BTreeNode::Leaf(left_leaf) => left_leaf.keys.append(&mut cur_keys),
+                    BTreeNode::Internal(_) => {
+                        unreachable!("Leaf/Internal mismatch is impossible here")
+                    }
+                }
+            }
+            BTreeNode::Internal(cur_internal) => {
+                let mut cur_keys = std::mem::take(&mut cur_internal.keys);
+                let mut cur_children = std::mem::take(&mut cur_internal.child_nodes);
+                match left_sibling {
+                    BTreeNode::Internal(left_internal) => {
+                        // When internal nodes merge, we have to pull down the parent key
+                        left_internal.keys.push(parent_left_key);
+                        left_internal.keys.append(&mut cur_keys);
+                        left_internal.child_nodes.append(&mut cur_children);
+                    }
+                    BTreeNode::Leaf(_) => {
+                        unreachable!("Leaf/Internal mismatch is impossible here")
+                    }
+                }
+            }
+        }
+
+        parent.child_nodes.remove(index);
+        parent.keys.remove(index - 1); // remove parent_left_key
+    }
+
+    fn merge_right(
+        &mut self,
+        parent: &mut InternalNode,
+        child: &mut BTreeNode,
+        right_sibling: &mut BTreeNode,
+        index: usize,
+        parent_right_key: u32,
+    ) {
+        match child {
+            BTreeNode::Leaf(cur_leaf) => {
+                let mut cur_keys = std::mem::take(&mut cur_leaf.keys);
+                match right_sibling {
+                    BTreeNode::Leaf(right_leaf) => {
+                        // cur_keys (left) must come first, then right_leaf's existing keys.
+                        cur_keys.append(&mut right_leaf.keys);
+                        right_leaf.keys = cur_keys;
+                    }
+                    BTreeNode::Internal(_) => {
+                        unreachable!("Leaf/Internal mismatch is impossible here")
+                    }
+                }
+            }
+            BTreeNode::Internal(cur_internal) => {
+                let mut cur_keys = std::mem::take(&mut cur_internal.keys);
+                let mut cur_children = std::mem::take(&mut cur_internal.child_nodes);
+                match right_sibling {
+                    BTreeNode::Internal(right_internal) => {
+                        // When internal nodes merge, we have to pull down the parent key
+                        cur_keys.push(parent_right_key);
+                        cur_keys.append(&mut right_internal.keys);
+                        right_internal.keys = cur_keys;
+
+                        cur_children.append(&mut right_internal.child_nodes);
+                        right_internal.child_nodes = cur_children;
+                    }
+                    BTreeNode::Leaf(_) => {
+                        unreachable!("Leaf/Internal mismatch is impossible here")
+                    }
+                }
+            }
+        }
+
+        parent.child_nodes.remove(index);
+        parent.keys.remove(index); // remove parent_right_key
+    }
+
+    // possible nodes we need to mutate:
+    //        [parent]
+    //      /    |    \
+    // [left] [child] [right]
+    fn rebalance(&mut self, parent: &mut InternalNode, index: usize) -> DeleteResult {
+        let child_node_id = parent.child_nodes[index];
+        let mut child = self.node_manager.get(child_node_id).unwrap();
+
+        let mut left = (index > 0).then(|| {
+            let id = parent.child_nodes[index - 1];
+            let parent_key = parent.keys[index - 1];
+            (id, parent_key, self.node_manager.get(id).unwrap())
+        });
+
+        // try to borrow from left sibling
+        if let Some((left_id, parent_left_key, ref mut left_sibling)) = left
+            && left_sibling.get_keys().len() > self.config.min_keys()
+        {
+            self.borrow_left(parent, &mut child, left_sibling, index, parent_left_key);
+
+            // TODO: check when to write which node, also resolve this by working with pages directly -> we write to the page, page is hanlded by buffer_pool
+            self.node_manager.write(left_id, left_sibling);
+
+            // we cannot create a new underflow, since the parent keys are only updated
+            return DeleteResult::Deleted;
+        }
+
+        let mut right = (index + 1 < parent.child_nodes.len()).then(|| {
+            let id = parent.child_nodes[index + 1];
+            let parent_key = parent.keys[index];
+            (id, parent_key, self.node_manager.get(id).unwrap())
+        });
+
+        // try to borrow from right sibling
+        if let Some((right_id, parent_right_key, ref mut right_sibling)) = right
+            && right_sibling.get_keys().len() > self.config.min_keys()
+        {
+            self.borrow_right(parent, &mut child, right_sibling, index, parent_right_key);
+
+            // TODO: check when to write which node, also resolve this by working with pages directly -> we write to the page, page is hanlded by buffer_pool
+            self.node_manager.write(right_id, right_sibling);
+
+            return DeleteResult::Deleted;
+        }
+
+        // try merging with the left sibling
+        if let Some((left_sibling_id, parent_left_key, ref mut left_sibling)) = left {
+            self.merge_left(parent, &mut child, left_sibling, index, parent_left_key);
+
+            // TODO: check when to write which node, also resolve this by working with pages directly -> we write to the page, page is hanlded by buffer_pool
+            self.node_manager.write(left_sibling_id, left_sibling);
+
+            if parent.keys.len() < self.config.min_keys() {
+                return DeleteResult::Rebalance;
+            }
+
+            return DeleteResult::Deleted;
+        }
+
+        // try merging with the right sibling
+        if let Some((right_id, parent_right_key, ref mut right_sibling)) = right {
+            self.merge_right(parent, &mut child, right_sibling, index, parent_right_key);
+
+            // TODO: check when to write which node, also resolve this by working with pages directly -> we write to the page, page is hanlded by buffer_pool
+            self.node_manager.write(right_id, right_sibling);
+
+            if parent.keys.len() < self.config.min_keys() {
+                return DeleteResult::Rebalance;
+            }
+
+            return DeleteResult::Deleted;
+        }
+
+        println!("Could not borrow or merge!"); // TODO: !!!
+        DeleteResult::Deleted
+    }
+
     fn delete_node(&mut self, node_id: PageId, value: u32) -> DeleteResult {
         let node = self.node_manager.get(node_id).unwrap();
         let index = node.find_child_index(value);
 
-        let child_node_id = match node {
-            BTreeNode::Leaf(leaf) => {
+        let mut internal = match node {
+            BTreeNode::Leaf(mut leaf) => {
                 let Some(index) = leaf.keys.iter().position(|&k| k == value) else {
                     return DeleteResult::NotFound;
                 };
 
                 leaf.keys.remove(index);
+                let leaf_keys_len = leaf.keys.len();
+                let del_key = leaf.keys[0];
+
+                self.node_manager
+                    .write(node_id, &BTreeNode::Leaf(leaf))
+                    .unwrap();
 
                 let min = self.config.min_keys();
 
-                if leaf.keys.len() < min {
-                    // TODO: check if we should update the parent seperator, when we do not rebalance?
-                    return DeleteResult::Rebalance;
-                } else {
-                    if index == 0 {
-                        return DeleteResult::DeletedUpdateInternal(leaf.keys[0]);
-                    } else {
-                        return DeleteResult::Deleted;
-                    }
-                }
+                // TODO: check if we should update the parent seperator, when we do not rebalance?
+                return match (leaf_keys_len < min, index == 0) {
+                    (true, _) => DeleteResult::Rebalance,
+                    (false, true) => DeleteResult::DeletedUpdateInternal(del_key),
+                    (false, false) => DeleteResult::Deleted,
+                };
             }
-            BTreeNode::Internal(internal) => internal.child_nodes[index],
+            BTreeNode::Internal(internal) => internal,
         };
 
-        let result = self.delete_node(child_node_id, value);
-
-        match result {
-            DeleteResult::Rebalance => {
-                // We know we have an internal here, since we checked the leaf case first, TODO: better way?
-                // possible nodes we need to mutate:
-                //        [parent]
-                //      /    |   \
-                // [left] [child] [right]
-
-                let (
-                    maybe_left_sibling_id,
-                    child_node_id,
-                    maybe_right_sibling_id,
-                    maybe_parent_left_key,
-                    maybe_parent_right_key,
-                ) = match self.node_manager.get(node_id).unwrap() {
-                    BTreeNode::Internal(internal) => (
-                        index
-                            .checked_sub(1)
-                            .and_then(|i| internal.child_nodes.get(i))
-                            .copied(),
-                        internal.child_nodes[index],
-                        internal.child_nodes.get(index + 1).copied(),
-                        index
-                            .checked_sub(1)
-                            .and_then(|i| internal.keys.get(i))
-                            .copied(),
-                        internal.keys.get(index).copied(),
-                    ),
-                    BTreeNode::Leaf(_) => unreachable!(),
-                };
-
-                if let Some(left_sibling_id) = maybe_left_sibling_id
-                    && let Some(parent_left_key) = maybe_parent_left_key
-                {
-                    let left_sibling = self.node_manager.get(left_sibling_id).unwrap();
-
-                    let len = match left_sibling {
-                        BTreeNode::Leaf(leaf) => leaf.keys.len(),
-                        BTreeNode::Internal(internal) => internal.keys.len(),
-                    };
-
-                    // try to borrow from left sibling
-                    // TODO: idea - break this done into node operations, like insert_left, insert_right, try_lend_right, try_lend_left, etc.
-                    if len > self.config.min_keys() {
-                        // For the -> direction, the borrowed key equals the seperator, since it will become the first key of the right child. (Leaf case).
-                        let (borrow_key, borrow_child) = match left_sibling {
-                            BTreeNode::Leaf(leaf) => (leaf.keys.pop().unwrap(), None),
-                            BTreeNode::Internal(internal) => {
-                                let k = internal.keys.pop().unwrap();
-                                let c = internal.child_nodes.pop().unwrap();
-                                (k, Some(c))
-                            }
-                        };
-
-                        let current_child = self.node_manager.get(child_node_id).unwrap();
-                        match current_child {
-                            BTreeNode::Leaf(leaf) => {
-                                leaf.keys.insert(0, borrow_key);
-                            }
-                            BTreeNode::Internal(internal) => {
-                                // when we do internal borrows, we need to rotate the seperator keys
-                                internal.keys.insert(0, parent_left_key);
-                                if let Some(child) = borrow_child {
-                                    internal.child_nodes.insert(0, child);
-                                }
-                            }
-                        }
-
-                        let parent_mut = match self.node_manager.get(node_id).unwrap() {
-                            BTreeNode::Internal(internal) => internal,
-                            BTreeNode::Leaf(_) => unreachable!(),
-                        };
-                        parent_mut.keys[index - 1] = borrow_key;
-
-                        // we cannot create a new underflow, since the parent keys are only updated
-                        return DeleteResult::Deleted;
-                    }
-                }
-
-                // try to borrow from right sibling
-                if let Some(right_sibling_id) = maybe_right_sibling_id
-                    && let Some(parent_right_key) = maybe_parent_right_key
-                {
-                    let right_sibling = self.node_manager.get(right_sibling_id).unwrap();
-                    let len = match right_sibling {
-                        BTreeNode::Leaf(leaf) => leaf.keys.len(),
-                        BTreeNode::Internal(internal) => internal.keys.len(),
-                    };
-
-                    if len > self.config.min_keys() {
-                        // For the -> direction, the borrowed key is different from the seperator to update (Leaf case).
-                        let (borrow_key, update_seperator_key, borrow_child) = match right_sibling {
-                            BTreeNode::Leaf(leaf_sibling) => (
-                                Some(leaf_sibling.keys.remove(0)),
-                                leaf_sibling.keys[0],
-                                None,
-                            ),
-                            BTreeNode::Internal(internal_sibling) => (
-                                None,
-                                internal_sibling.keys.remove(0),
-                                Some(internal_sibling.child_nodes.remove(0)),
-                            ),
-                        };
-
-                        let current_child = self.node_manager.get(child_node_id).unwrap();
-                        match current_child {
-                            BTreeNode::Leaf(leaf) => {
-                                let key = borrow_key.expect(
-                                    "Value has to be since sibling must be both leaf nodes.",
-                                );
-                                leaf.keys.push(key);
-                            }
-                            BTreeNode::Internal(internal) => {
-                                internal.keys.push(parent_right_key);
-                                if let Some(child) = borrow_child {
-                                    internal.child_nodes.push(child);
-                                }
-                            }
-                        }
-
-                        let parent_mut = match self.node_manager.get(node_id).unwrap() {
-                            BTreeNode::Internal(internal) => internal,
-                            BTreeNode::Leaf(_) => unreachable!(),
-                        };
-                        parent_mut.keys[index] = update_seperator_key;
-                        return DeleteResult::Deleted;
-                    }
-                }
-
-                // try merging with the left sibling
-                if let Some(left_sibling_id) = maybe_left_sibling_id {
-                    match self.node_manager.get(child_node_id).unwrap() {
-                        BTreeNode::Leaf(cur_leaf) => {
-                            let mut cur_keys = std::mem::take(&mut cur_leaf.keys);
-                            match self.node_manager.get(left_sibling_id).unwrap() {
-                                BTreeNode::Leaf(left_leaf) => left_leaf.keys.append(&mut cur_keys),
-                                BTreeNode::Internal(_) => {
-                                    unreachable!("Leaf/Internal mismatch is impossible here")
-                                }
-                            }
-                        }
-                        BTreeNode::Internal(cur_internal) => {
-                            let mut cur_keys = std::mem::take(&mut cur_internal.keys);
-                            let mut cur_children = std::mem::take(&mut cur_internal.child_nodes);
-                            match self.node_manager.get(left_sibling_id).unwrap() {
-                                BTreeNode::Internal(left_internal) => {
-                                    // When internal nodes merge, we have to pull down the parent key
-                                    let parent_left_key = maybe_parent_left_key
-                                        .expect("left sibling implies a separator key exists");
-                                    left_internal.keys.push(parent_left_key);
-                                    left_internal.keys.append(&mut cur_keys);
-                                    left_internal.child_nodes.append(&mut cur_children);
-                                }
-                                BTreeNode::Leaf(_) => {
-                                    unreachable!("Leaf/Internal mismatch is impossible here")
-                                }
-                            }
-                        }
-                    }
-
-                    let parent_mut = match self.node_manager.get(node_id).unwrap() {
-                        BTreeNode::Internal(internal) => internal,
-                        BTreeNode::Leaf(_) => unreachable!(),
-                    };
-                    parent_mut.child_nodes.remove(index);
-                    parent_mut.keys.remove(index - 1); // remove parent_left_key
-
-                    if parent_mut.keys.len() < self.config.min_keys() {
-                        return DeleteResult::Rebalance;
-                    }
-
-                    return DeleteResult::Deleted;
-                }
-
-                // try merging with the right sibling
-                if let Some(right_sibling_id) = maybe_right_sibling_id {
-                    match self.node_manager.get(child_node_id).unwrap() {
-                        BTreeNode::Leaf(cur_leaf) => {
-                            let mut cur_keys = std::mem::take(&mut cur_leaf.keys);
-                            match self.node_manager.get(right_sibling_id).unwrap() {
-                                BTreeNode::Leaf(right_leaf) => {
-                                    // cur_keys (left) must come first, then right_leaf's existing keys.
-                                    cur_keys.append(&mut right_leaf.keys);
-                                    right_leaf.keys = cur_keys;
-                                }
-                                BTreeNode::Internal(_) => {
-                                    unreachable!("Leaf/Internal mismatch is impossible here")
-                                }
-                            }
-                        }
-                        BTreeNode::Internal(cur_internal) => {
-                            let mut cur_keys = std::mem::take(&mut cur_internal.keys);
-                            let mut cur_children = std::mem::take(&mut cur_internal.child_nodes);
-                            match self.node_manager.get(right_sibling_id).unwrap() {
-                                BTreeNode::Internal(right_internal) => {
-                                    // When internal nodes merge, we have to pull down the parent key
-                                    let parent_right_key = maybe_parent_right_key
-                                        .expect("right sibling implies a separator key exists");
-                                    cur_keys.push(parent_right_key);
-                                    cur_keys.append(&mut right_internal.keys);
-                                    right_internal.keys = cur_keys;
-
-                                    cur_children.append(&mut right_internal.child_nodes);
-                                    right_internal.child_nodes = cur_children;
-                                }
-                                BTreeNode::Leaf(_) => {
-                                    unreachable!("Leaf/Internal mismatch is impossible here")
-                                }
-                            }
-                        }
-                    }
-
-                    let parent_mut = match self.node_manager.get(node_id).unwrap() {
-                        BTreeNode::Internal(internal) => internal,
-                        BTreeNode::Leaf(_) => unreachable!(),
-                    };
-                    parent_mut.child_nodes.remove(index);
-                    parent_mut.keys.remove(index); // remove parent_right_key
-
-                    if parent_mut.keys.len() < self.config.min_keys() {
-                        return DeleteResult::Rebalance;
-                    }
-
-                    return DeleteResult::Deleted;
-                }
-
-                println!("Could not borrow or merge!"); // TODO: !!!
-                DeleteResult::Deleted
-            }
+        let (result, dirty) = match self.delete_node(internal.child_nodes[index], value) {
+            DeleteResult::Rebalance => (self.rebalance(&mut internal, index), true),
             DeleteResult::DeletedUpdateInternal(new_min) => {
+                // TODO: check this case, do we really want to stop propagation for index = 0?
                 if index > 0 {
-                    let parent_mut = match self.node_manager.get(node_id).unwrap() {
-                        BTreeNode::Internal(internal) => internal,
-                        BTreeNode::Leaf(_) => unreachable!(),
-                    };
-                    parent_mut.keys[index - 1] = new_min;
+                    internal.keys[index - 1] = new_min;
+                    (DeleteResult::Deleted, true)
+                } else {
+                    (DeleteResult::Deleted, false)
                 }
-                DeleteResult::Deleted
             }
-            other => other,
+            other => (other, false),
+        };
+
+        if dirty {
+            self.node_manager
+                .write(node_id, &BTreeNode::Internal(internal))
+                .unwrap();
         }
+
+        result
     }
 
     // we can always call this to restore the invariant, but there may be cases where a more trivial way exists the update the key(s)
@@ -733,6 +748,72 @@ impl BTreeNode {
 
     pub fn find_child_index(&self, value: u32) -> usize {
         self.get_keys().partition_point(|&k| k <= value)
+    }
+
+    /// Move the last key (and child) of `self` to the front of `right`, which is
+    /// the sibling directly to the right of `self`. `separator` is the parent key
+    /// between the two; the returned key replaces it.
+    ///
+    /// Leaf: the moved key becomes the first key of `right`, so it is also the new separator.
+    /// Internal: the separator rotates down into `right`, and the moved key rotates up.
+    fn lend_to_right(&mut self, right: &mut BTreeNode, separator: u32) -> u32 {
+        match (self, right) {
+            (BTreeNode::Leaf(left), BTreeNode::Leaf(right)) => {
+                let key = left.keys.pop().unwrap();
+                right.keys.insert(0, key);
+                key
+            }
+            (BTreeNode::Internal(left), BTreeNode::Internal(right)) => {
+                let key = left.keys.pop().unwrap();
+                let child = left.child_nodes.pop().unwrap();
+                right.keys.insert(0, separator);
+                right.child_nodes.insert(0, child);
+                key
+            }
+            _ => unreachable!("siblings are always the same node kind"),
+        }
+    }
+
+    /// Move the first key (and child) of `self` to the end of `left`, which is
+    /// the sibling directly to the left of `self`. Mirror of [`lend_to_right`].
+    ///
+    /// Leaf: the new separator is whatever key is now first in `self`.
+    /// Internal: the separator rotates down into `left`, and the moved key rotates up.
+    fn lend_to_left(&mut self, left: &mut BTreeNode, separator: u32) -> u32 {
+        match (self, left) {
+            (BTreeNode::Leaf(right), BTreeNode::Leaf(left)) => {
+                let key = right.keys.remove(0);
+                left.keys.push(key);
+                right.keys[0]
+            }
+            (BTreeNode::Internal(right), BTreeNode::Internal(left)) => {
+                let key = right.keys.remove(0);
+                let child = right.child_nodes.remove(0);
+                left.keys.push(separator);
+                left.child_nodes.push(child);
+                key
+            }
+            _ => unreachable!("siblings are always the same node kind"),
+        }
+    }
+
+    /// Absorb `right` (the sibling directly to the right of `self`) into `self`.
+    /// `separator` is the parent key between the two; for internal nodes it is
+    /// pulled down into the merged node, for leaves it is simply dropped.
+    fn merge_right(&mut self, right: BTreeNode, separator: u32) {
+        match (self, right) {
+            (BTreeNode::Leaf(left), BTreeNode::Leaf(mut right)) => {
+                left.keys.append(&mut right.keys);
+                // keep the leaf chain intact, skipping the merged-away leaf
+                left.right_leaf = right.right_leaf;
+            }
+            (BTreeNode::Internal(left), BTreeNode::Internal(mut right)) => {
+                left.keys.push(separator);
+                left.keys.append(&mut right.keys);
+                left.child_nodes.append(&mut right.child_nodes);
+            }
+            _ => unreachable!("siblings are always the same node kind"),
+        }
     }
 
     // fn print(&self, node_id: PageId, depth: usize, arena: &Arena) {
