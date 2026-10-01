@@ -1,8 +1,8 @@
-use std::fmt::Error;
+use core::fmt;
+use std::sync::Arc;
 
 use super::node::{BTreeNode, InternalNode, LeafNode};
-use crate::buffer_pool::{self, BufferPool};
-use crate::index::{self, node};
+use crate::buffer_pool::{InMemoryPageStore, PageError, PageStore};
 use crate::page::{Page, PageId};
 
 impl LeafNode {
@@ -23,35 +23,41 @@ impl InternalNode {
     }
 }
 
-#[derive(Debug)]
 pub struct BPlusTree {
     root_id: PageId,
     node_manager: NodeManager,
     config: TreeConfig,
 }
-
+impl fmt::Debug for BPlusTree {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BPlusTree")
+            .field("root_id", &self.root_id)
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
 #[derive(PartialEq, Debug)]
 pub struct TreeConfig {
     max_order: usize,
     debug: bool,
 }
 
-#[derive(Debug)]
 struct NodeManager {
-    buffer_pool: BufferPool,
+    buffer_pool: Arc<dyn PageStore>,
 }
+
 impl NodeManager {
-    fn get(&mut self, node_id: PageId) -> std::io::Result<BTreeNode> {
+    fn get(&self, node_id: PageId) -> Result<BTreeNode, PageError> {
         let page = self.buffer_pool.get_page(node_id)?;
         let node = BTreeNode::from_page(&page)?;
         Ok(node)
     }
-    fn create(&mut self, node: BTreeNode) -> std::io::Result<PageId> {
+    fn create(&mut self, node: BTreeNode) -> Result<PageId, PageError> {
         let page = node.into_page();
         let node_id = self.buffer_pool.allocate_page(page)?;
         Ok(node_id)
     }
-    fn write(&mut self, node_id: PageId, node: &BTreeNode) -> std::io::Result<()> {
+    fn write(&mut self, node_id: PageId, node: &BTreeNode) -> Result<(), PageError> {
         let page = node.into_page();
         self.buffer_pool.write_page(node_id, page)?;
         Ok(())
@@ -89,17 +95,15 @@ impl TreeConfig {
 }
 
 impl BPlusTree {
-    pub fn new(buffer_pool: BufferPool, config: TreeConfig) -> Self {
-        let mut node_manager = NodeManager {
-            buffer_pool: buffer_pool,
-        };
+    pub fn new(buffer_pool: Arc<dyn PageStore>, config: TreeConfig) -> Self {
+        let mut node_manager = NodeManager { buffer_pool };
 
         let root = BTreeNode::Leaf(LeafNode::new(&config));
         let root_id = node_manager.create(root).unwrap();
 
         Self {
-            root_id: root_id,
-            node_manager: node_manager,
+            root_id,
+            node_manager,
             config,
         }
     }
@@ -248,7 +252,7 @@ impl BPlusTree {
                 leaf.keys.insert(index, value);
                 if leaf.keys.len() < self.config.max_order {
                     self.node_manager
-                        .write(node_id, BTreeNode::Leaf(leaf))
+                        .write(node_id, &BTreeNode::Leaf(leaf))
                         .unwrap();
                     return InsertResult::Inserted;
                 }
@@ -268,7 +272,7 @@ impl BPlusTree {
                 // Link the current leaf to the new one
                 leaf.right_leaf = Some(split_node_id);
                 self.node_manager
-                    .write(node_id, BTreeNode::Leaf(leaf))
+                    .write(node_id, &BTreeNode::Leaf(leaf))
                     .unwrap();
 
                 return InsertResult::Split(InsertSplit {
@@ -292,7 +296,7 @@ impl BPlusTree {
 
         if internal_keys_after_insert < self.config.max_order {
             self.node_manager
-                .write(node_id, BTreeNode::Internal(internal))
+                .write(node_id, &BTreeNode::Internal(internal))
                 .unwrap();
             return InsertResult::Inserted;
         }
@@ -309,7 +313,7 @@ impl BPlusTree {
             .create(BTreeNode::Internal(internal_split_node))
             .unwrap();
         self.node_manager
-            .write(node_id, BTreeNode::Internal(internal))
+            .write(node_id, &BTreeNode::Internal(internal))
             .unwrap();
 
         InsertResult::Split(InsertSplit {
@@ -342,7 +346,7 @@ impl BPlusTree {
                 // TODO: refactor !!!
                 let root = self.node_manager.get(self.root_id).unwrap();
 
-                let should_recompute = if let BTreeNode::Internal(root_internal) = root
+                let should_recompute = if let BTreeNode::Internal(mut root_internal) = root
                     && root_internal.child_nodes.len() == 1
                 {
                     // Replace root with its only child
@@ -356,7 +360,7 @@ impl BPlusTree {
                 if should_recompute && let Some(keys) = self.recompute_keys(self.root_id) {
                     let new_root = self.node_manager.get(self.root_id).unwrap();
 
-                    if let BTreeNode::Internal(new_internal_root) = new_root {
+                    if let BTreeNode::Internal(mut new_internal_root) = new_root {
                         new_internal_root.keys = keys;
                     }
                 }
@@ -528,7 +532,7 @@ impl BPlusTree {
 }
 
 impl BPlusTree {
-    fn nodes_equal(&mut self, left_id: PageId, right: &Self, right_id: PageId) -> bool {
+    fn nodes_equal(&self, left_id: PageId, right: &Self, right_id: PageId) -> bool {
         let Ok(left_node) = self.node_manager.get(left_id) else {
             return false;
         };
@@ -743,11 +747,19 @@ impl NodeBuilder {
         self
     }
 
-    //  fn build(self, config: TreeConfig) -> BPlusTree {
-    //  let mut arena = Arena::new();
-    //      let root_id = self.build_into(&mut arena);
-    //      BPlusTree::from_root_with_arena(config, root_id, arena)
-    //  }
+    fn build(self, config: TreeConfig) -> BPlusTree {
+        unimplemented!();
+    }
+
+    fn from_list(values: Vec<u32>, config: TreeConfig) -> BPlusTree {
+        let page_store = InMemoryPageStore::new();
+        let mut btree = BPlusTree::new(Arc::new(page_store), config);
+
+        for v in values {
+            btree.insert(v);
+        }
+        btree
+    }
 
     // fn build_into(&self, arena: &mut Arena) -> PageId {
     //     match self.kind {
@@ -772,77 +784,19 @@ impl NodeBuilder {
 }
 
 fn build_main_tree() -> BPlusTree {
-    let mut btree = BPlusTree::new(TreeConfig::new(4));
-    btree.insert(3);
-    btree.print();
-    btree.insert(33);
-    btree.print();
-    btree.insert(45);
-    btree.print();
-    btree.insert(12);
-    btree.print();
-    btree.insert(75);
-    btree.print();
-    btree.insert(85);
-    btree.print();
-    btree.insert(32);
-    btree.print();
-    btree.insert(1);
-    btree.print();
-    btree.insert(23);
-    btree.print();
-    btree.insert(30);
-    btree.print();
-    btree.insert(34);
-    btree.print();
+    let v = vec![3, 33, 45, 12, 75, 85, 32, 1, 23, 30, 34];
+    let config = TreeConfig::new(4);
+    let btree = NodeBuilder::from_list(v, config);
+
     btree
 }
 fn build_tree_example_2() -> BPlusTree {
-    let mut btree = BPlusTree::new(TreeConfig::new(4));
-    btree.insert(3);
-    btree.print();
-    btree.insert(33);
-    btree.print();
-    btree.insert(45);
-    btree.print();
-    btree.insert(12);
-    btree.print();
-    btree.insert(75);
-    btree.print();
-    btree.insert(85);
-    btree.print();
-    btree.insert(32);
-    btree.print();
-    btree.insert(1);
-    btree.print();
-    btree.insert(23);
-    btree.print();
-    btree.insert(30);
-    btree.print();
-    btree.insert(44);
-    btree.print();
-    btree.insert(41);
-    btree.print();
-    btree.insert(83);
-    btree.print();
-    btree.insert(25);
-    btree.print();
-    btree.insert(52);
-    btree.print();
-    btree.insert(76);
-    btree.print();
-    btree.insert(35);
-    btree.print();
-    btree.insert(62);
-    btree.print();
-    btree.insert(203);
-    btree.print();
-    btree.insert(63);
-    btree.print();
-    btree.insert(40);
-    btree.print();
-    btree.insert(24);
-    btree.print();
+    let v = vec![
+        3, 33, 45, 12, 75, 85, 32, 1, 23, 30, 44, 41, 83, 25, 52, 76, 35, 62, 203, 63, 40, 24,
+    ];
+    let config = TreeConfig::new(4);
+    let btree = NodeBuilder::from_list(v, config);
+
     btree
 }
 
@@ -875,7 +829,7 @@ fn test_insert_example_1() {
 
 #[test]
 fn test_find_inserted_values() {
-    let btree = build_main_tree();
+    let mut btree = build_main_tree();
     for &val in &[3u32, 33, 45, 12, 75, 85, 32, 1, 23, 30, 34] {
         assert!(btree.find(val), "Expected to find {val} in tree");
     }
@@ -1138,7 +1092,7 @@ fn test_delete_root_collapse_recomputes_keys_from_leftmost_leaves() {
 
 #[test]
 fn test_range_full_scan_returns_sorted_all_keys() {
-    let tree = build_tree_example_2();
+    let mut tree = build_tree_example_2();
     tree.print();
     let range = tree.range(None, None);
     let mut expected = vec![
@@ -1150,7 +1104,7 @@ fn test_range_full_scan_returns_sorted_all_keys() {
 
 #[test]
 fn test_range_bounded_returns_subset() {
-    let tree = build_tree_example_2();
+    let mut tree = build_tree_example_2();
     // Keys in [12, 34]: 12, 23, 30, 32, 33, 34 (assuming inclusive bounds;
     // flip to exclusive per your confirmed range() semantics if needed).
     let range = tree.range(Some(12), Some(34));
@@ -1159,21 +1113,21 @@ fn test_range_bounded_returns_subset() {
 
 #[test]
 fn test_range_no_matches_returns_empty() {
-    let tree = build_tree_example_2();
+    let mut tree = build_tree_example_2();
     let range = tree.range(Some(1000), Some(2000));
     assert!(range.is_empty());
 }
 
 #[test]
 fn test_range_single_key_bounds() {
-    let tree = build_tree_example_2();
+    let mut tree = build_tree_example_2();
     let range = tree.range(Some(33), Some(33));
     assert_eq!(range, vec![33]);
 }
 
 #[test]
 fn test_range_open_lower_bound() {
-    let tree = build_tree_example_2();
+    let mut tree = build_tree_example_2();
     // Everything up to and including 12: 1, 3, 12
     let range = tree.range(None, Some(12));
     assert_eq!(range, vec![1, 3, 12]);
@@ -1181,7 +1135,7 @@ fn test_range_open_lower_bound() {
 
 #[test]
 fn test_range_open_upper_bound() {
-    let tree = build_tree_example_2();
+    let mut tree = build_tree_example_2();
     // Everything from 75 onward: 75, 85
     let range = tree.range(Some(75), None);
     assert_eq!(range, vec![75, 76, 83, 85, 203]);
