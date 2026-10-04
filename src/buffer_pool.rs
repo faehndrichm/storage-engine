@@ -1,6 +1,6 @@
 use crate::{
     disk::Disk,
-    page::{Page, PageId},
+    page::{Page, PageId, PageKind},
 };
 use core::fmt;
 use std::{
@@ -14,6 +14,7 @@ pub enum PageError {
     Io(io::Error),
     PageNotFound(PageId),
     LockPoisoned,
+    UnexpectedPageKind(PageKind),
 }
 
 pub trait PageStore {

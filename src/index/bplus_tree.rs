@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use super::node::{BTreeNode, InternalNode, LeafNode};
 use crate::buffer_pool::{InMemoryPageStore, PageError, PageStore};
-use crate::page::{Page, PageId};
+use crate::page::{InternalPage, LeafPage, Page, PageHeader, PageId, PageKind};
 
 impl LeafNode {
     fn new(config: &TreeConfig) -> Self {
@@ -25,7 +25,7 @@ impl InternalNode {
 
 pub struct BPlusTree {
     root_id: PageId,
-    node_manager: NodeManager,
+    buffer_pool: Arc<dyn PageStore>,
     config: TreeConfig,
 }
 impl fmt::Debug for BPlusTree {
@@ -40,28 +40,6 @@ impl fmt::Debug for BPlusTree {
 pub struct TreeConfig {
     max_order: usize,
     debug: bool,
-}
-
-struct NodeManager {
-    buffer_pool: Arc<dyn PageStore>,
-}
-
-impl NodeManager {
-    fn get(&self, node_id: PageId) -> Result<BTreeNode, PageError> {
-        let page = self.buffer_pool.get_page(node_id)?;
-        let node = BTreeNode::from_page(&page)?;
-        Ok(node)
-    }
-    fn create(&mut self, node: BTreeNode) -> Result<PageId, PageError> {
-        let page = node.into_page();
-        let node_id = self.buffer_pool.allocate_page(page)?;
-        Ok(node_id)
-    }
-    fn write(&mut self, node_id: PageId, node: &BTreeNode) -> Result<(), PageError> {
-        let page = node.into_page();
-        self.buffer_pool.write_page(node_id, page)?;
-        Ok(())
-    }
 }
 
 impl TreeConfig {
@@ -96,14 +74,12 @@ impl TreeConfig {
 
 impl BPlusTree {
     pub fn new(buffer_pool: Arc<dyn PageStore>, config: TreeConfig) -> Self {
-        let mut node_manager = NodeManager { buffer_pool };
-
         let root = BTreeNode::Leaf(LeafNode::new(&config));
-        let root_id = node_manager.create(root).unwrap();
+        let root_id = buffer_pool.allocate_page(root.into_page()).unwrap();
 
         Self {
             root_id,
-            node_manager,
+            buffer_pool,
             config,
         }
     }
@@ -145,12 +121,28 @@ impl BPlusTree {
 // }
 
 impl BPlusTree {
+    fn get_node(&self, node_id: PageId) -> Result<BTreeNode, PageError> {
+        let page = self.buffer_pool.get_page(node_id)?;
+        let node = BTreeNode::from_page(&page, &self.config)?;
+        Ok(node)
+    }
+    fn create_node(&mut self, node: BTreeNode) -> Result<PageId, PageError> {
+        let page = node.into_page();
+        let node_id = self.buffer_pool.allocate_page(page)?;
+        Ok(node_id)
+    }
+    fn write_node(&mut self, node_id: PageId, node: &BTreeNode) -> Result<(), PageError> {
+        let page = node.into_page();
+        self.buffer_pool.write_page(node_id, page)?;
+        Ok(())
+    }
+
     pub fn find(&mut self, value: u32) -> bool {
         self.find_node(self.root_id, value)
     }
 
     fn find_node(&mut self, node_id: PageId, value: u32) -> bool {
-        let node = self.node_manager.get(node_id).unwrap();
+        let node = self.get_node(node_id).unwrap();
 
         match node {
             BTreeNode::Leaf(leaf) => leaf.keys.contains(&value),
@@ -168,7 +160,7 @@ impl BPlusTree {
     }
 
     pub fn descend_to_leaf(&mut self, node_id: PageId, from: u32) -> PageId {
-        let node = self.node_manager.get(node_id).unwrap();
+        let node = self.get_node(node_id).unwrap();
         match node {
             BTreeNode::Leaf(_) => node_id,
             BTreeNode::Internal(internal) => {
@@ -184,7 +176,7 @@ impl BPlusTree {
         let mut first = true;
 
         while let Some(cur) = current_node_id {
-            let leaf = match self.node_manager.get(cur).unwrap() {
+            let leaf = match self.get_node(cur).unwrap() {
                 BTreeNode::Leaf(l) => l,
                 _ => unreachable!(),
             };
@@ -227,8 +219,7 @@ impl BPlusTree {
 
                 // assign new root
                 let new_root_id = self
-                    .node_manager
-                    .create(BTreeNode::Internal(new_root_node))
+                    .create_node(BTreeNode::Internal(new_root_node))
                     .unwrap();
                 self.root_id = new_root_id;
                 true
@@ -239,7 +230,7 @@ impl BPlusTree {
     }
 
     fn insert_node(&mut self, node_id: PageId, value: u32) -> InsertResult {
-        let node = self.node_manager.get(node_id).unwrap();
+        let node = self.get_node(node_id).unwrap();
         let index = node.find_child_index(value);
 
         // handle leaf case first
@@ -251,9 +242,7 @@ impl BPlusTree {
 
                 leaf.keys.insert(index, value);
                 if leaf.keys.len() < self.config.max_order {
-                    self.node_manager
-                        .write(node_id, &BTreeNode::Leaf(leaf))
-                        .unwrap();
+                    self.write_node(node_id, &BTreeNode::Leaf(leaf)).unwrap();
                     return InsertResult::Inserted;
                 }
 
@@ -264,16 +253,11 @@ impl BPlusTree {
                 // Connect the new node to the previous right neighbour
                 split_node.right_leaf = leaf.right_leaf;
                 let separator_key = split_node.keys[0];
-                let split_node_id = self
-                    .node_manager
-                    .create(BTreeNode::Leaf(split_node))
-                    .unwrap();
+                let split_node_id = self.create_node(BTreeNode::Leaf(split_node)).unwrap();
 
                 // Link the current leaf to the new one
                 leaf.right_leaf = Some(split_node_id);
-                self.node_manager
-                    .write(node_id, &BTreeNode::Leaf(leaf))
-                    .unwrap();
+                self.write_node(node_id, &BTreeNode::Leaf(leaf)).unwrap();
 
                 return InsertResult::Split(InsertSplit {
                     seperator_key: separator_key,
@@ -295,8 +279,7 @@ impl BPlusTree {
         let internal_keys_after_insert = internal.keys.len();
 
         if internal_keys_after_insert < self.config.max_order {
-            self.node_manager
-                .write(node_id, &BTreeNode::Internal(internal))
+            self.write_node(node_id, &BTreeNode::Internal(internal))
                 .unwrap();
             return InsertResult::Inserted;
         }
@@ -309,11 +292,9 @@ impl BPlusTree {
 
         let seperator_key = internal.keys.pop().unwrap();
         let split_node_id = self
-            .node_manager
-            .create(BTreeNode::Internal(internal_split_node))
+            .create_node(BTreeNode::Internal(internal_split_node))
             .unwrap();
-        self.node_manager
-            .write(node_id, &BTreeNode::Internal(internal))
+        self.write_node(node_id, &BTreeNode::Internal(internal))
             .unwrap();
 
         InsertResult::Split(InsertSplit {
@@ -331,7 +312,7 @@ impl BPlusTree {
             DeleteResult::NotFound => false,
             DeleteResult::Deleted => true,
             DeleteResult::DeletedUpdateInternal(_) => {
-                let root = self.node_manager.get(self.root_id).unwrap();
+                let root = self.get_node(self.root_id).unwrap();
                 match root {
                     BTreeNode::Leaf(_) => {
                         // Can be ignored, the root is a single leaf.
@@ -344,7 +325,7 @@ impl BPlusTree {
             }
             DeleteResult::Rebalance => {
                 // TODO: refactor !!!
-                let root = self.node_manager.get(self.root_id).unwrap();
+                let root = self.get_node(self.root_id).unwrap();
 
                 let should_recompute = if let BTreeNode::Internal(mut root_internal) = root
                     && root_internal.child_nodes.len() == 1
@@ -358,7 +339,7 @@ impl BPlusTree {
 
                 // it seems in this case its preferable to recompute all keys from the children
                 if should_recompute && let Some(keys) = self.recompute_keys(self.root_id) {
-                    let new_root = self.node_manager.get(self.root_id).unwrap();
+                    let new_root = self.get_node(self.root_id).unwrap();
 
                     if let BTreeNode::Internal(mut new_internal_root) = new_root {
                         new_internal_root.keys = keys;
@@ -376,12 +357,12 @@ impl BPlusTree {
     // [left] [child] [right]
     fn rebalance(&mut self, parent: &mut InternalNode, index: usize) -> DeleteResult {
         let child_node_id = parent.child_nodes[index];
-        let mut child = self.node_manager.get(child_node_id).unwrap();
+        let mut child = self.get_node(child_node_id).unwrap();
 
         let mut left = (index > 0).then(|| {
             let id = parent.child_nodes[index - 1];
             let parent_key = parent.keys[index - 1];
-            (id, parent_key, self.node_manager.get(id).unwrap())
+            (id, parent_key, self.get_node(id).unwrap())
         });
 
         // try to borrow from left sibling
@@ -392,7 +373,7 @@ impl BPlusTree {
 
             parent.keys[index - 1] = borrow_key;
             // TODO: check when to write which node, also resolve this by working with pages directly -> we write to the page, page is hanlded by buffer_pool
-            self.node_manager.write(left_id, left_sibling);
+            self.write_node(left_id, left_sibling);
 
             // we cannot create a new underflow, since the parent keys are only updated
             return DeleteResult::Deleted;
@@ -401,7 +382,7 @@ impl BPlusTree {
         let mut right = (index + 1 < parent.child_nodes.len()).then(|| {
             let id = parent.child_nodes[index + 1];
             let parent_key = parent.keys[index];
-            (id, parent_key, self.node_manager.get(id).unwrap())
+            (id, parent_key, self.get_node(id).unwrap())
         });
 
         // try to borrow from right sibling
@@ -412,7 +393,7 @@ impl BPlusTree {
 
             parent.keys[index] = update_seperator_key;
             // TODO: check when to write which node, also resolve this by working with pages directly -> we write to the page, page is hanlded by buffer_pool
-            self.node_manager.write(right_id, right_sibling);
+            self.write_node(right_id, right_sibling);
 
             return DeleteResult::Deleted;
         }
@@ -425,7 +406,7 @@ impl BPlusTree {
             parent.keys.remove(index - 1); // remove parent_left_key
             //
             // TODO: check when to write which node, also resolve this by working with pages directly -> we write to the page, page is hanlded by buffer_pool
-            self.node_manager.write(left_sibling_id, left_sibling);
+            self.write_node(left_sibling_id, left_sibling);
 
             if parent.keys.len() < self.config.min_keys() {
                 return DeleteResult::Rebalance;
@@ -442,7 +423,7 @@ impl BPlusTree {
             parent.keys.remove(index); // remove parent_right_key
 
             // TODO: check when to write which node, also resolve this by working with pages directly -> we write to the page, page is hanlded by buffer_pool
-            self.node_manager.write(right_id, right_sibling);
+            self.write_node(right_id, right_sibling);
 
             if parent.keys.len() < self.config.min_keys() {
                 return DeleteResult::Rebalance;
@@ -456,7 +437,7 @@ impl BPlusTree {
     }
 
     fn delete_node(&mut self, node_id: PageId, value: u32) -> DeleteResult {
-        let node = self.node_manager.get(node_id).unwrap();
+        let node = self.get_node(node_id).unwrap();
         let index = node.find_child_index(value);
 
         let mut internal = match node {
@@ -469,9 +450,7 @@ impl BPlusTree {
                 let leaf_keys_len = leaf.keys.len();
                 let del_key = leaf.keys[0];
 
-                self.node_manager
-                    .write(node_id, &BTreeNode::Leaf(leaf))
-                    .unwrap();
+                self.write_node(node_id, &BTreeNode::Leaf(leaf)).unwrap();
 
                 let min = self.config.min_keys();
 
@@ -500,8 +479,7 @@ impl BPlusTree {
         };
 
         if dirty {
-            self.node_manager
-                .write(node_id, &BTreeNode::Internal(internal))
+            self.write_node(node_id, &BTreeNode::Internal(internal))
                 .unwrap();
         }
 
@@ -510,7 +488,7 @@ impl BPlusTree {
 
     // we can always call this to restore the invariant, but there may be cases where a more trivial way exists the update the key(s)
     fn recompute_keys(&mut self, node_id: PageId) -> Option<Vec<u32>> {
-        match self.node_manager.get(node_id).unwrap() {
+        match self.get_node(node_id).unwrap() {
             BTreeNode::Internal(internal) => Some(
                 internal
                     .child_nodes
@@ -524,7 +502,7 @@ impl BPlusTree {
     }
 
     fn leftmost_key(&mut self, node_id: PageId) -> u32 {
-        match self.node_manager.get(node_id).unwrap() {
+        match self.get_node(node_id).unwrap() {
             BTreeNode::Leaf(leaf) => leaf.keys[0],
             BTreeNode::Internal(internal) => self.leftmost_key(internal.child_nodes[0]),
         }
@@ -533,10 +511,10 @@ impl BPlusTree {
 
 impl BPlusTree {
     fn nodes_equal(&self, left_id: PageId, right: &Self, right_id: PageId) -> bool {
-        let Ok(left_node) = self.node_manager.get(left_id) else {
+        let Ok(left_node) = self.get_node(left_id) else {
             return false;
         };
-        let Ok(right_node) = self.node_manager.get(right_id) else {
+        let Ok(right_node) = self.get_node(right_id) else {
             return false;
         };
 
@@ -585,12 +563,71 @@ enum InsertResult {
 }
 
 impl BTreeNode {
-    pub fn from_page(page: &Page) -> std::io::Result<Self> {
-        unimplemented!()
+    pub fn from_page(page: &Page, config: &TreeConfig) -> Result<Self, PageError> {
+        let header = PageHeader::decode(page.to_bytes());
+
+        match header.kind {
+            PageKind::BtreeInternal => {
+                let mut node = InternalNode::new(config);
+                let node_view = InternalPage::new(page);
+
+                let key_count = node_view.key_count();
+                for i in 0..key_count {
+                    node.keys.push(node_view.key(i));
+                    node.child_nodes.push(node_view.child_node(i));
+                }
+                node.child_nodes.push(node_view.child_node(key_count)); // +1 childs
+
+                Ok(BTreeNode::Internal(node))
+            }
+            PageKind::BtreeLeaf => {
+                let mut node = LeafNode::new(config);
+                let node_view = LeafPage::new(page);
+
+                let key_count = node_view.key_count();
+                node.right_leaf = node_view.right_leaf();
+
+                for i in 0..key_count {
+                    node.keys.push(node_view.key(i));
+                }
+                Ok(BTreeNode::Leaf(node))
+            }
+            other => Err(PageError::UnexpectedPageKind(other)),
+        }
     }
 
     pub fn into_page(&self) -> Page {
-        unimplemented!()
+        match self {
+            BTreeNode::Leaf(leaf_node) => {
+                let mut page = Page::new(PageKind::BtreeLeaf);
+                let mut node_view = LeafPage::new(&mut page);
+
+                node_view.set_key_count(leaf_node.keys.len());
+                node_view.set_right_leaf(leaf_node.right_leaf);
+
+                for (i, &key) in leaf_node.keys.iter().enumerate() {
+                    node_view.set_key(i, key);
+                }
+
+                page
+            }
+            BTreeNode::Internal(internal_node) => {
+                let mut page = Page::new(PageKind::BtreeInternal);
+                let mut node_view = InternalPage::new(&mut page);
+
+                node_view.set_key_count(internal_node.keys.len());
+
+                for (i, &key) in internal_node.keys.iter().enumerate() {
+                    node_view.set_key(i, key);
+                }
+
+                for (i, &child_id) in internal_node.child_nodes.iter().enumerate() {
+                    node_view.set_child_node(i, child_id);
+                }
+
+                page
+            }
+        }
     }
 
     pub fn get_keys(&self) -> &Vec<u32> {
@@ -748,7 +785,53 @@ impl NodeBuilder {
     }
 
     fn build(self, config: TreeConfig) -> BPlusTree {
-        unimplemented!();
+        let store: Arc<dyn PageStore> = Arc::new(InMemoryPageStore::new());
+        let mut leaves = Vec::new();
+        let root_id = self.build_into(store.as_ref(), &mut leaves);
+
+        for pair in leaves.windows(2) {
+            let (left_id, right_id) = (pair[0], pair[1]);
+            let page = store.get_page(left_id).unwrap();
+            let BTreeNode::Leaf(mut leaf) = BTreeNode::from_page(&page, &config).unwrap() else {
+                unreachable!("collected ids are leaves");
+            };
+            leaf.right_leaf = Some(right_id);
+            store
+                .write_page(left_id, BTreeNode::Leaf(leaf).into_page())
+                .unwrap();
+        }
+
+        BPlusTree {
+            root_id,
+            buffer_pool: store,
+            config,
+        }
+    }
+
+    fn build_into(&self, store: &dyn PageStore, leaves: &mut Vec<PageId>) -> PageId {
+        let node = match self.kind {
+            NodeKind::Leaf => BTreeNode::Leaf(LeafNode {
+                keys: self.keys.clone(),
+                right_leaf: None,
+            }),
+            NodeKind::Internal => {
+                let child_nodes = self
+                    .children
+                    .iter()
+                    .map(|child| child.build_into(store, leaves))
+                    .collect();
+                BTreeNode::Internal(InternalNode {
+                    keys: self.keys.clone(),
+                    child_nodes,
+                })
+            }
+        };
+
+        let id = store.allocate_page(node.into_page()).unwrap();
+        if let NodeKind::Leaf = self.kind {
+            leaves.push(id);
+        }
+        id
     }
 
     fn from_list(values: Vec<u32>, config: TreeConfig) -> BPlusTree {
