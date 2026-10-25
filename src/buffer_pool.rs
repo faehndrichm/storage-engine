@@ -20,6 +20,7 @@ pub enum PageError {
 pub trait PageStore {
     fn get_page(&self, id: PageId) -> Result<Arc<Page>, PageError>;
     fn write_page(&self, id: PageId, page: Page) -> Result<(), PageError>;
+    fn free_page(&self, id: PageId) -> Result<(), PageError>;
     fn allocate_page(&self, page: Page) -> Result<PageId, PageError>;
 }
 
@@ -71,6 +72,10 @@ impl PageStore for BufferPool {
         Ok(())
     }
 
+    fn free_page(&self, page_id: PageId) -> Result<(), PageError> {
+        unimplemented!()
+    }
+
     fn allocate_page(&self, page: Page) -> Result<PageId, PageError> {
         let page_id = self
             .next_page_id
@@ -114,6 +119,11 @@ impl PageStore for InMemoryPageStore {
 
     fn write_page(&self, page_id: PageId, page: Page) -> Result<(), PageError> {
         self.cache.write()?.insert(page_id, Arc::new(page));
+        Ok(())
+    }
+
+    fn free_page(&self, page_id: PageId) -> Result<(), PageError> {
+        self.cache.write()?.remove(&page_id);
         Ok(())
     }
 

@@ -96,11 +96,26 @@ impl BPlusTree {
 
     pub fn print(&self) {
         println!("B+ Tree:");
-        // TODO
-        //let root = self.arena.get(self.root_id).unwrap();
-        //root.print(self.root_id, 0, &self.arena);
+        self.print_node(self.root_id, 0);
         println!("End");
         println!("");
+    }
+
+    fn print_node(&self, node_id: PageId, depth: usize) {
+        match self.get_node(node_id).unwrap() {
+            BTreeNode::Leaf(leaf) => leaf.print(node_id, depth),
+            BTreeNode::Internal(internal) => {
+                let indent = "  ".repeat(depth);
+                println!(
+                    "{}Internal {:?}, node_id: {}",
+                    indent, internal.keys, node_id
+                );
+
+                for child_id in internal.child_nodes {
+                    self.print_node(child_id, depth + 1);
+                }
+            }
+        }
     }
 
     pub fn print_config(&self) {
@@ -137,6 +152,10 @@ impl BPlusTree {
         Ok(())
     }
 
+    fn free_node(&mut self, node_id: PageId) -> Result<(), PageError> {
+        self.buffer_pool.free_page(node_id)?;
+        Ok(())
+    }
     pub fn find(&mut self, value: u32) -> bool {
         self.find_node(self.root_id, value)
     }
@@ -373,7 +392,8 @@ impl BPlusTree {
 
             parent.keys[index - 1] = borrow_key;
             // TODO: check when to write which node, also resolve this by working with pages directly -> we write to the page, page is hanlded by buffer_pool
-            self.write_node(left_id, left_sibling);
+            self.write_node(left_id, left_sibling).unwrap();
+            self.write_node(child_node_id, &child).unwrap();
 
             // we cannot create a new underflow, since the parent keys are only updated
             return DeleteResult::Deleted;
@@ -393,7 +413,8 @@ impl BPlusTree {
 
             parent.keys[index] = update_seperator_key;
             // TODO: check when to write which node, also resolve this by working with pages directly -> we write to the page, page is hanlded by buffer_pool
-            self.write_node(right_id, right_sibling);
+            self.write_node(right_id, right_sibling).unwrap();
+            self.write_node(child_node_id, &child).unwrap();
 
             return DeleteResult::Deleted;
         }
@@ -406,8 +427,8 @@ impl BPlusTree {
             parent.keys.remove(index - 1); // remove parent_left_key
             //
             // TODO: check when to write which node, also resolve this by working with pages directly -> we write to the page, page is hanlded by buffer_pool
-            self.write_node(left_sibling_id, left_sibling);
-
+            self.write_node(left_sibling_id, left_sibling).unwrap();
+            self.free_node(child_node_id).unwrap();
             if parent.keys.len() < self.config.min_keys() {
                 return DeleteResult::Rebalance;
             }
@@ -419,11 +440,12 @@ impl BPlusTree {
         if let Some((right_id, parent_right_key, ref mut right_sibling)) = right {
             child.merge_right_into(right_sibling, parent_right_key);
 
-            parent.child_nodes.remove(index);
+            parent.child_nodes.remove(index + 1);
             parent.keys.remove(index); // remove parent_right_key
 
             // TODO: check when to write which node, also resolve this by working with pages directly -> we write to the page, page is hanlded by buffer_pool
-            self.write_node(right_id, right_sibling);
+            self.write_node(child_node_id, &child).unwrap();
+            self.free_node(right_id).unwrap();
 
             if parent.keys.len() < self.config.min_keys() {
                 return DeleteResult::Rebalance;
@@ -447,17 +469,20 @@ impl BPlusTree {
                 };
 
                 leaf.keys.remove(index);
-                let leaf_keys_len = leaf.keys.len();
-                let del_key = leaf.keys[0];
+
+                let leaf_keys = leaf.keys.clone();
 
                 self.write_node(node_id, &BTreeNode::Leaf(leaf)).unwrap();
 
                 let min = self.config.min_keys();
 
                 // TODO: check if we should update the parent seperator, when we do not rebalance?
-                return match (leaf_keys_len < min, index == 0) {
+                return match (leaf_keys.len() < min, index == 0) {
                     (true, _) => DeleteResult::Rebalance,
-                    (false, true) => DeleteResult::DeletedUpdateInternal(del_key),
+                    (false, true) => {
+                        let del_key = leaf_keys[0];
+                        DeleteResult::DeletedUpdateInternal(del_key)
+                    }
                     (false, false) => DeleteResult::Deleted,
                 };
             }
@@ -510,27 +535,27 @@ impl BPlusTree {
 }
 
 impl BPlusTree {
-    fn nodes_equal(&self, left_id: PageId, right: &Self, right_id: PageId) -> bool {
-        let Ok(left_node) = self.get_node(left_id) else {
+    fn nodes_equal(&self, self_id: PageId, other: &Self, other_id: PageId) -> bool {
+        let Ok(self_node) = self.get_node(self_id) else {
             return false;
         };
-        let Ok(right_node) = self.get_node(right_id) else {
+        let Ok(other_node) = other.get_node(other_id) else {
             return false;
         };
 
-        match (left_node, right_node) {
-            (BTreeNode::Leaf(left_leaf), BTreeNode::Leaf(right_leaf)) => {
-                left_leaf.keys == right_leaf.keys
+        match (self_node, other_node) {
+            (BTreeNode::Leaf(self_leaf), BTreeNode::Leaf(other_leaf)) => {
+                self_leaf.keys == other_leaf.keys
             }
-            (BTreeNode::Internal(left_internal), BTreeNode::Internal(right_internal)) => {
-                left_internal.keys == right_internal.keys
-                    && left_internal.child_nodes.len() == right_internal.child_nodes.len()
-                    && left_internal
+            (BTreeNode::Internal(self_internal), BTreeNode::Internal(other_internal)) => {
+                self_internal.keys == other_internal.keys
+                    && self_internal.child_nodes.len() == other_internal.child_nodes.len()
+                    && self_internal
                         .child_nodes
                         .iter()
-                        .zip(right_internal.child_nodes.iter())
-                        .all(|(left_child_id, right_child_id)| {
-                            self.nodes_equal(*left_child_id, right, *right_child_id)
+                        .zip(other_internal.child_nodes.iter())
+                        .all(|(self_child_id, other_child_id)| {
+                            self.nodes_equal(*self_child_id, other, *other_child_id)
                         })
             }
             _ => false,
@@ -673,11 +698,11 @@ impl BTreeNode {
                 update_seperator_key
             }
             (BTreeNode::Internal(current), BTreeNode::Internal(right)) => {
-                let update_seperator_key = current.keys.remove(0);
-                let borrow_child = current.child_nodes.remove(0);
+                let update_seperator_key = right.keys.remove(0);
+                let borrow_child = right.child_nodes.remove(0);
 
-                right.keys.push(parent_right_key);
-                right.child_nodes.push(borrow_child);
+                current.keys.push(parent_right_key);
+                current.child_nodes.push(borrow_child);
                 update_seperator_key
             }
             _ => unreachable!("Leaf/Internal mismatch is impossible here"),
