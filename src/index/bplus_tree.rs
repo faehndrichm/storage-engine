@@ -432,12 +432,6 @@ impl BPlusTree {
             parent.child_nodes.remove(index);
             parent.keys.remove(index - 1); // remove parent_left_key
 
-            if index > 0
-                && let BTreeNode::Leaf(leaf) = &child
-            {
-                parent.keys[index - 1] = leaf.keys[0];
-            }
-
             // TODO: check when to write which node, also resolve this by working with pages directly -> we write to the page, page is hanlded by buffer_pool
             self.write_node(left_sibling_id, left_sibling).unwrap();
             self.free_node(child_node_id).unwrap();
