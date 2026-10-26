@@ -36,4 +36,18 @@ impl Disk {
     fn sync(&self) -> std::io::Result<()> {
         self.file.sync_data()
     }
+
+    pub fn write_at_offset(
+        &self,
+        page_id: PageId,
+        offset: usize,
+        buf: &[u8],
+    ) -> std::io::Result<()> {
+        assert!(
+            offset + buf.len() <= PAGE_SIZE,
+            "cannot write accros page boundary!"
+        );
+        self.file
+            .write_all_at(buf, (page_id as usize * PAGE_SIZE + offset) as u64)
+    }
 }

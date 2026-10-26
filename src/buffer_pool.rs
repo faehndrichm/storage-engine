@@ -1,11 +1,11 @@
 use crate::{
     disk::Disk,
-    page::{Page, PageId, PageKind},
+    page::{Page, PageHeader, PageId, PageKind},
 };
 use core::fmt;
 use std::{
     collections::HashMap,
-    io,
+    io::{self},
     sync::{Arc, PoisonError, RwLock, atomic::AtomicU32},
 };
 
@@ -48,6 +48,16 @@ pub struct BufferPool {
     next_page_id: AtomicU32,
 }
 
+impl BufferPool {
+    pub fn new(disk: Disk) -> Self {
+        Self {
+            disk,
+            cache: RwLock::new(HashMap::new()),
+            next_page_id: AtomicU32::new(0),
+        }
+    }
+}
+
 impl PageStore for BufferPool {
     fn get_page(&self, page_id: PageId) -> Result<Arc<Page>, PageError> {
         if let Some(cached_page) = self.cache.read().unwrap().get(&page_id) {
@@ -55,6 +65,12 @@ impl PageStore for BufferPool {
         }
 
         let bytes = self.disk.read(page_id)?;
+
+        let header = PageHeader::decode(&bytes);
+        if header.is_deleted {
+            return Err(PageError::PageNotFound(page_id));
+        }
+
         let page = Arc::new(Page::from_bytes(bytes));
 
         self.cache
@@ -73,7 +89,15 @@ impl PageStore for BufferPool {
     }
 
     fn free_page(&self, page_id: PageId) -> Result<(), PageError> {
-        unimplemented!()
+        // mark the page dead on disk first, then forget it
+        self.disk.write_at_offset(
+            page_id,
+            PageHeader::IS_DELETED_OFFSET,
+            &PageHeader::IS_DELETED_MARK,
+        )?;
+
+        self.cache.write().unwrap().remove(&page_id);
+        Ok(())
     }
 
     fn allocate_page(&self, page: Page) -> Result<PageId, PageError> {
@@ -135,5 +159,32 @@ impl PageStore for InMemoryPageStore {
         self.cache.write()?.insert(page_id, Arc::new(page));
 
         Ok(page_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn freed_page_is_not_found_after_cache_is_gone() {
+        let path = std::env::temp_dir().join(format!(
+            "storage-engine-{}-freed-page.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let pool = BufferPool::new(Disk::create(path.to_str().unwrap()).unwrap());
+        let page_id = pool.allocate_page(Page::new(PageKind::BtreeLeaf)).unwrap();
+        assert!(pool.get_page(page_id).is_ok());
+
+        pool.free_page(page_id).unwrap();
+
+        assert!(matches!(
+            pool.get_page(page_id),
+            Err(PageError::PageNotFound(id)) if id == page_id
+        ));
+
+        let _ = std::fs::remove_file(&path);
     }
 }

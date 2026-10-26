@@ -53,7 +53,7 @@ pub struct PageHeader {
     free_start: u16,
     free_end: u16,
     pub kind: PageKind,
-    is_deleted: bool,
+    pub is_deleted: bool,
 }
 
 #[derive(Debug)]
@@ -190,6 +190,14 @@ impl<'a> ByteUnpacker<'a> {
 }
 
 impl PageHeader {
+    pub const IS_DELETED_OFFSET: usize = 8 // lsn
+    + 4 // page_id
+    + 2 // slot_count
+    + 2 // free_start
+    + 2 // free_end
+    + 1; // kind
+    pub const IS_DELETED_MARK: [u8; 1] = [1];
+
     pub fn encode<'a>(&self, buf: &'a mut [u8; PAGE_SIZE]) {
         let mut packer = BytePacker::new(buf);
 
@@ -354,5 +362,32 @@ mod tests {
         let decoded_header = PageHeader::decode(&buf);
 
         assert_eq!(header, decoded_header);
+    }
+
+    #[test]
+    fn is_deleted_flag_sits_at_its_offset() {
+        let mut header = PageHeader {
+            lsn: 0x0502070403060708,
+            page_id: 0x11121314,
+            slot_count: 0x2122,
+            free_start: 0x3132,
+            free_end: 0x4142,
+            kind: PageKind::BtreeLeaf,
+            is_deleted: false,
+        };
+
+        let mut alive = [0u8; PAGE_SIZE];
+        header.encode(&mut alive);
+
+        header.is_deleted = true;
+        let mut dead = [0u8; PAGE_SIZE];
+        header.encode(&mut dead);
+
+        let changed: Vec<usize> = (0..PAGE_SIZE).filter(|&i| alive[i] != dead[i]).collect();
+        assert_eq!(changed, vec![PageHeader::IS_DELETED_OFFSET]);
+        assert_eq!(
+            dead[PageHeader::IS_DELETED_OFFSET],
+            PageHeader::IS_DELETED_MARK[0]
+        );
     }
 }
