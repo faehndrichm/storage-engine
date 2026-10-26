@@ -30,10 +30,25 @@ pub struct BPlusTree {
 }
 impl fmt::Debug for BPlusTree {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BPlusTree")
-            .field("root_id", &self.root_id)
-            .field("config", &self.config)
-            .finish_non_exhaustive()
+        writeln!(f)?;
+        self.fmt_node(f, self.root_id, 0)
+    }
+}
+
+impl BPlusTree {
+    fn fmt_node(&self, f: &mut fmt::Formatter<'_>, node_id: PageId, depth: usize) -> fmt::Result {
+        let indent = "  ".repeat(depth);
+        match self.get_node(node_id) {
+            Ok(BTreeNode::Leaf(leaf)) => writeln!(f, "{indent}Leaf {:?}", leaf.keys),
+            Ok(BTreeNode::Internal(internal)) => {
+                writeln!(f, "{indent}Internal {:?}", internal.keys)?;
+                for child_id in internal.child_nodes {
+                    self.fmt_node(f, child_id, depth + 1)?;
+                }
+                Ok(())
+            }
+            Err(e) => writeln!(f, "{indent}<unreadable page {node_id}: {e:?}>"),
+        }
     }
 }
 #[derive(PartialEq, Debug)]
@@ -329,44 +344,21 @@ impl BPlusTree {
 
         match self.delete_node(self.root_id, value) {
             DeleteResult::NotFound => false,
-            DeleteResult::Deleted => true,
-            DeleteResult::DeletedUpdateInternal(_) => {
-                let root = self.get_node(self.root_id).unwrap();
-                match root {
-                    BTreeNode::Leaf(_) => {
-                        // Can be ignored, the root is a single leaf.
-                    }
-                    BTreeNode::Internal(_) => {
-                        panic!("UpdateInternal propagated to root!");
-                    }
-                };
-                true
-            }
-            DeleteResult::Rebalance => {
-                // TODO: refactor !!!
+            // a new minimum is dropped at the root, there is no separator that points at it
+            DeleteResult::Rebalance | DeleteResult::RebalanceNewMinimum(_) => {
                 let root = self.get_node(self.root_id).unwrap();
 
-                let should_recompute = if let BTreeNode::Internal(mut root_internal) = root
+                if let BTreeNode::Internal(mut root_internal) = root
                     && root_internal.child_nodes.len() == 1
                 {
                     // Replace root with its only child
+                    let old_root_id = self.root_id;
                     self.root_id = root_internal.child_nodes.remove(0);
-                    true
-                } else {
-                    false
-                };
-
-                // it seems in this case its preferable to recompute all keys from the children
-                if should_recompute && let Some(keys) = self.recompute_keys(self.root_id) {
-                    let new_root = self.get_node(self.root_id).unwrap();
-
-                    if let BTreeNode::Internal(mut new_internal_root) = new_root {
-                        new_internal_root.keys = keys;
-                    }
+                    self.free_node(old_root_id).unwrap();
                 }
-                // If root is a leaf there's nothing to do here (TODO)
                 true
             }
+            _ => true,
         }
     }
 
@@ -391,6 +383,7 @@ impl BPlusTree {
             let borrow_key = child.borrow_from_left(left_sibling, parent_left_key);
 
             parent.keys[index - 1] = borrow_key;
+
             // TODO: check when to write which node, also resolve this by working with pages directly -> we write to the page, page is hanlded by buffer_pool
             self.write_node(left_id, left_sibling).unwrap();
             self.write_node(child_node_id, &child).unwrap();
@@ -412,9 +405,22 @@ impl BPlusTree {
             let update_seperator_key = child.borrow_from_right(right_sibling, parent_right_key);
 
             parent.keys[index] = update_seperator_key;
+
+            if index > 0
+                && let BTreeNode::Leaf(leaf) = &child
+            {
+                parent.keys[index - 1] = leaf.keys[0];
+            }
+
             // TODO: check when to write which node, also resolve this by working with pages directly -> we write to the page, page is hanlded by buffer_pool
             self.write_node(right_id, right_sibling).unwrap();
             self.write_node(child_node_id, &child).unwrap();
+
+            if index == 0
+                && let BTreeNode::Leaf(leaf) = &child
+            {
+                return DeleteResult::NewMinimum(leaf.keys[0]);
+            }
 
             return DeleteResult::Deleted;
         }
@@ -425,7 +431,13 @@ impl BPlusTree {
 
             parent.child_nodes.remove(index);
             parent.keys.remove(index - 1); // remove parent_left_key
-            //
+
+            if index > 0
+                && let BTreeNode::Leaf(leaf) = &child
+            {
+                parent.keys[index - 1] = leaf.keys[0];
+            }
+
             // TODO: check when to write which node, also resolve this by working with pages directly -> we write to the page, page is hanlded by buffer_pool
             self.write_node(left_sibling_id, left_sibling).unwrap();
             self.free_node(child_node_id).unwrap();
@@ -447,15 +459,22 @@ impl BPlusTree {
             self.write_node(child_node_id, &child).unwrap();
             self.free_node(right_id).unwrap();
 
-            if parent.keys.len() < self.config.min_keys() {
-                return DeleteResult::Rebalance;
+            let result = if parent.keys.len() < self.config.min_keys() {
+                DeleteResult::Rebalance
+            } else {
+                DeleteResult::Deleted
+            };
+
+            if index == 0
+                && let BTreeNode::Leaf(leaf) = &child
+            {
+                return result.with_new_minimum(leaf.keys[0]);
             }
 
-            return DeleteResult::Deleted;
+            return result;
         }
 
-        println!("Could not borrow or merge!"); // TODO: !!!
-        DeleteResult::Deleted
+        unreachable!("internal node without siblings, tree invariant violated");
     }
 
     fn delete_node(&mut self, node_id: PageId, value: u32) -> DeleteResult {
@@ -481,7 +500,7 @@ impl BPlusTree {
                     (true, _) => DeleteResult::Rebalance,
                     (false, true) => {
                         let del_key = leaf_keys[0];
-                        DeleteResult::DeletedUpdateInternal(del_key)
+                        DeleteResult::NewMinimum(del_key)
                     }
                     (false, false) => DeleteResult::Deleted,
                 };
@@ -490,14 +509,23 @@ impl BPlusTree {
         };
 
         let (result, dirty) = match self.delete_node(internal.child_nodes[index], value) {
+            DeleteResult::RebalanceNewMinimum(new_min) => {
+                // apply the minimum first, a merge pulls the separator down
+                if index > 0 {
+                    internal.keys[index - 1] = new_min;
+                    (self.rebalance(&mut internal, index), true)
+                } else {
+                    let result = self.rebalance(&mut internal, index);
+                    (result.with_new_minimum(new_min), true)
+                }
+            }
             DeleteResult::Rebalance => (self.rebalance(&mut internal, index), true),
-            DeleteResult::DeletedUpdateInternal(new_min) => {
-                // TODO: check this case, do we really want to stop propagation for index = 0?
+            DeleteResult::NewMinimum(new_min) => {
                 if index > 0 {
                     internal.keys[index - 1] = new_min;
                     (DeleteResult::Deleted, true)
                 } else {
-                    (DeleteResult::Deleted, false)
+                    (DeleteResult::NewMinimum(new_min), false)
                 }
             }
             other => (other, false),
@@ -509,28 +537,6 @@ impl BPlusTree {
         }
 
         result
-    }
-
-    // we can always call this to restore the invariant, but there may be cases where a more trivial way exists the update the key(s)
-    fn recompute_keys(&mut self, node_id: PageId) -> Option<Vec<u32>> {
-        match self.get_node(node_id).unwrap() {
-            BTreeNode::Internal(internal) => Some(
-                internal
-                    .child_nodes
-                    .iter()
-                    .skip(1)
-                    .map(|child_id| self.leftmost_key(*child_id))
-                    .collect(),
-            ),
-            BTreeNode::Leaf(_) => None,
-        }
-    }
-
-    fn leftmost_key(&mut self, node_id: PageId) -> u32 {
-        match self.get_node(node_id).unwrap() {
-            BTreeNode::Leaf(leaf) => leaf.keys[0],
-            BTreeNode::Internal(internal) => self.leftmost_key(internal.child_nodes[0]),
-        }
     }
 }
 
@@ -577,8 +583,19 @@ struct InsertSplit {
 enum DeleteResult {
     NotFound,
     Deleted,
-    DeletedUpdateInternal(u32),
+    NewMinimum(u32),
     Rebalance,
+    RebalanceNewMinimum(u32),
+}
+
+impl DeleteResult {
+    fn with_new_minimum(self, new_min: u32) -> Self {
+        match self {
+            DeleteResult::Deleted => DeleteResult::NewMinimum(new_min),
+            DeleteResult::Rebalance => DeleteResult::RebalanceNewMinimum(new_min),
+            other => other,
+        }
+    }
 }
 
 enum InsertResult {
@@ -1077,7 +1094,7 @@ fn test_delete_internal_left_merge_preserves_separator_key() {
                 .child(NodeBuilder::leaf([5, 6])),
         )
         .child(
-            NodeBuilder::internal([30, 45])
+            NodeBuilder::internal([30, 50])
                 .child(NodeBuilder::leaf([20, 25]))
                 .child(NodeBuilder::leaf([30, 35]))
                 .child(NodeBuilder::leaf([50])),
@@ -1247,4 +1264,206 @@ fn test_range_open_upper_bound() {
     // Everything from 75 onward: 75, 85
     let range = tree.range(Some(75), None);
     assert_eq!(range, vec![75, 76, 83, 85, 203]);
+}
+
+// Deleting the smallest key of a subtree that is the first child of a non-first child must
+// update the separator in the higher ancestor, the update cannot stop at index 0.
+//
+// B+ Tree:
+// Internal [20, 50]
+//   Internal [10]
+//     Leaf [5, 6]
+//     Leaf [10, 11]
+//   Internal [30]
+//     Leaf [20, 25]   <- delete 20
+//     Leaf [30, 35]
+//   Internal [60]
+//     Leaf [50, 55]
+//     Leaf [60, 65]
+// End
+#[test]
+fn test_delete_min_of_first_child_updates_ancestor_separator() {
+    let mut tree = NodeBuilder::internal([20, 50])
+        .child(
+            NodeBuilder::internal([10])
+                .child(NodeBuilder::leaf([5, 6]))
+                .child(NodeBuilder::leaf([10, 11])),
+        )
+        .child(
+            NodeBuilder::internal([30])
+                .child(NodeBuilder::leaf([20, 25]))
+                .child(NodeBuilder::leaf([30, 35])),
+        )
+        .child(
+            NodeBuilder::internal([60])
+                .child(NodeBuilder::leaf([50, 55]))
+                .child(NodeBuilder::leaf([60, 65])),
+        )
+        .build(TreeConfig::new(4));
+
+    assert!(tree.delete(20));
+
+    let expected = NodeBuilder::internal([25, 50])
+        .child(
+            NodeBuilder::internal([10])
+                .child(NodeBuilder::leaf([5, 6]))
+                .child(NodeBuilder::leaf([10, 11])),
+        )
+        .child(
+            NodeBuilder::internal([30])
+                .child(NodeBuilder::leaf([25]))
+                .child(NodeBuilder::leaf([30, 35])),
+        )
+        .child(
+            NodeBuilder::internal([60])
+                .child(NodeBuilder::leaf([50, 55]))
+                .child(NodeBuilder::leaf([60, 65])),
+        )
+        .build(TreeConfig::new(4));
+
+    assert_eq!(tree, expected);
+}
+
+// A leaf at index 0 underflows and borrows from its right sibling. Its minimum changes from
+// the deleted key to the borrowed one, so the separator in the higher ancestor must follow.
+//
+// B+ Tree:
+// Internal [20, 50]
+//   Internal [10]
+//     Leaf [5, 6]
+//     Leaf [10, 11]
+//   Internal [30]
+//     Leaf [20]       <- delete 20, underflows and borrows 30 from the right
+//     Leaf [30, 35]
+//   Internal [60]
+//     Leaf [50, 55]
+//     Leaf [60, 65]
+// End
+#[test]
+fn test_delete_borrow_from_right_at_index_0_updates_ancestor_separator() {
+    let mut tree = NodeBuilder::internal([20, 50])
+        .child(
+            NodeBuilder::internal([10])
+                .child(NodeBuilder::leaf([5, 6]))
+                .child(NodeBuilder::leaf([10, 11])),
+        )
+        .child(
+            NodeBuilder::internal([30])
+                .child(NodeBuilder::leaf([20]))
+                .child(NodeBuilder::leaf([30, 35])),
+        )
+        .child(
+            NodeBuilder::internal([60])
+                .child(NodeBuilder::leaf([50, 55]))
+                .child(NodeBuilder::leaf([60, 65])),
+        )
+        .build(TreeConfig::new(4));
+
+    assert!(tree.delete(20));
+
+    let expected = NodeBuilder::internal([30, 50])
+        .child(
+            NodeBuilder::internal([10])
+                .child(NodeBuilder::leaf([5, 6]))
+                .child(NodeBuilder::leaf([10, 11])),
+        )
+        .child(
+            NodeBuilder::internal([35])
+                .child(NodeBuilder::leaf([30]))
+                .child(NodeBuilder::leaf([35])),
+        )
+        .child(
+            NodeBuilder::internal([60])
+                .child(NodeBuilder::leaf([50, 55]))
+                .child(NodeBuilder::leaf([60, 65])),
+        )
+        .build(TreeConfig::new(4));
+
+    assert_eq!(tree, expected);
+}
+
+// An internal node underflows while its subtree minimum changes at the same time. The parent
+// must apply the new minimum before it merges, since the merge pulls the separator down.
+//
+// Deleting 20 empties Leaf [20], it merges with Leaf [30] (the minimum of Internal [30] becomes
+// 30) and Internal [30] is left with a single child, so it merges into its left sibling.
+// The separator pulled down from the root must be 30, not the stale 20.
+//
+// B+ Tree:
+// Internal [20, 50]
+//   Internal [10]
+//     Leaf [5, 6]
+//     Leaf [10, 11]
+//   Internal [30]
+//     Leaf [20]       <- delete 20
+//     Leaf [30]
+//   Internal [60]
+//     Leaf [50, 55]
+//     Leaf [60, 65]
+// End
+#[test]
+fn test_delete_rebalance_and_min_update_at_same_time() {
+    let mut tree = NodeBuilder::internal([20, 50])
+        .child(
+            NodeBuilder::internal([10])
+                .child(NodeBuilder::leaf([5, 6]))
+                .child(NodeBuilder::leaf([10, 11])),
+        )
+        .child(
+            NodeBuilder::internal([30])
+                .child(NodeBuilder::leaf([20]))
+                .child(NodeBuilder::leaf([30])),
+        )
+        .child(
+            NodeBuilder::internal([60])
+                .child(NodeBuilder::leaf([50, 55]))
+                .child(NodeBuilder::leaf([60, 65])),
+        )
+        .build(TreeConfig::new(4));
+
+    assert!(tree.delete(20));
+
+    let expected = NodeBuilder::internal([50])
+        .child(
+            NodeBuilder::internal([10, 30])
+                .child(NodeBuilder::leaf([5, 6]))
+                .child(NodeBuilder::leaf([10, 11]))
+                .child(NodeBuilder::leaf([30])),
+        )
+        .child(
+            NodeBuilder::internal([60])
+                .child(NodeBuilder::leaf([50, 55]))
+                .child(NodeBuilder::leaf([60, 65])),
+        )
+        .build(TreeConfig::new(4));
+
+    assert_eq!(tree, expected);
+}
+
+// A leaf at index > 0 underflows and borrows from its right sibling. Its first key changes from
+// the deleted key to the borrowed one, so the parent separator in front of it must follow.
+//
+// B+ Tree:
+// Internal [10, 30]
+//   Leaf [5]
+//   Leaf [10]         <- delete 10, underflows and borrows 30 from the right
+//   Leaf [30, 35]
+// End
+#[test]
+fn test_delete_borrow_from_right_at_index_gt_0_updates_own_separator() {
+    let mut tree = NodeBuilder::internal([10, 30])
+        .child(NodeBuilder::leaf([5]))
+        .child(NodeBuilder::leaf([10]))
+        .child(NodeBuilder::leaf([30, 35]))
+        .build(TreeConfig::new(4));
+
+    assert!(tree.delete(10));
+
+    let expected = NodeBuilder::internal([30, 35])
+        .child(NodeBuilder::leaf([5]))
+        .child(NodeBuilder::leaf([30]))
+        .child(NodeBuilder::leaf([35]))
+        .build(TreeConfig::new(4));
+
+    assert_eq!(tree, expected);
 }
